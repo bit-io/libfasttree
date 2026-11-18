@@ -1,0 +1,51 @@
+use "std -> test" from "test"
+use "std -> env" from "env"
+mod check
+use "std -> fs" from "fs"
+mod text
+mod sys
+mod overlay
+
+#[test]
+fn list_changes_reports_files_not_dirs() is
+    let up: string = text::path_join(sys::tmp_dir(), "fasttree-h-ov-" + text::istr(sys::pid()))
+    sys::rm_rf(up)
+    fs::mkdir(up + "/etc/sub")
+    let w1: bool = fs::write(up + "/etc/hosts", "x")
+    let w2: bool = fs::write(up + "/etc/sub/deep", "y")
+    let w3: bool = fs::write(up + "/top", "z")
+    let ov: overlay::Overlay = overlay::Overlay { lowerdir: "", upperdir: up, workdir: "", mountpoint: "", ephemeral: false, tmpfs_mount: "" }
+    let ch: [string] = overlay::list_changes(ov)
+    check::eq(text::istr(ch.len()), "3")
+    let joined: string = text::join(ch, ",")
+    test::assert_true(joined.contains("etc/hosts"))
+    test::assert_true(joined.contains("etc/sub/deep"))
+    test::assert_true(joined.contains("top"))
+    sys::rm_rf(up)
+end
+
+#[test]
+fn empty_or_missing_upperdir_is_no_changes() is
+    let ov: overlay::Overlay = overlay::Overlay { lowerdir: "", upperdir: "/nonexistent/zz", workdir: "", mountpoint: "", ephemeral: false, tmpfs_mount: "" }
+    check::eq(text::istr(overlay::list_changes(ov).len()), "0")
+end
+
+#[test]
+fn list_active_overlays_distinguishes_ephemeral() is
+    let root: string = text::path_join(sys::tmp_dir(), "fasttree-h-ovl-" + text::istr(sys::pid()))
+    sys::rm_rf(root)
+    fs::mkdir(root + "/overlay-mounts/persist")
+    fs::mkdir(root + "/overlay-mounts/tmp1")
+    fs::mkdir(root + "/overlay-mounts/tmp1.tmpfs")
+    let ovs: [overlay::OverlayInfo] = overlay::list_active_overlays(root)
+    check::eq(text::istr(ovs.len()), "2")
+    for o in ovs is
+        test::assert_false(o.mounted)
+        if o.name == "tmp1" is test::assert_true(o.ephemeral) end
+        if o.name == "persist" is test::assert_false(o.ephemeral) end
+    end
+    sys::rm_rf(root)
+end
+
+fn main() is
+end

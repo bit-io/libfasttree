@@ -1,0 +1,62 @@
+use "std -> test" from "test"
+use "std -> env" from "env"
+mod check
+mod text
+mod hashing
+mod sys
+mod json
+mod oci
+
+#[test]
+fn parse_image_ref_variants() is
+    let a: oci::RefResult = oci::parse_image_ref("ghcr.io/hackeros/system:v2.0")
+    test::assert_true(a.ok)
+    check::eq(a.ref.registry, "ghcr.io")
+    check::eq(a.ref.repository, "hackeros/system")
+    check::eq(a.ref.reference, "v2.0")
+    let b: oci::RefResult = oci::parse_image_ref("localhost:5000/team/app")
+    check::eq(b.ref.registry, "localhost:5000")
+    check::eq(b.ref.repository, "team/app")
+    check::eq(b.ref.reference, "latest")
+    let c: oci::RefResult = oci::parse_image_ref("reg.io/a/b@sha256:abc")
+    check::eq(c.ref.repository, "a/b@sha256")
+    test::assert_false(oci::parse_image_ref("bez-ukosnika").ok)
+end
+
+#[test]
+fn scheme_is_http_only_for_loopback() is
+    check::eq(oci::registry_scheme("localhost:5000"), "http")
+    check::eq(oci::registry_scheme("127.0.0.1"), "http")
+    check::eq(oci::registry_scheme("ghcr.io"), "https")
+    check::eq(oci::registry_scheme("192.168.1.5:5000"), "https")
+end
+
+#[test]
+fn www_authenticate_params() is
+    let h: string = "Bearer realm=\"https://auth.example/token\",service=\"reg\",scope=\"repository:a/b:pull,push\""
+    check::eq(oci::auth_param(h, "realm"), "https://auth.example/token")
+    check::eq(oci::auth_param(h, "service"), "reg")
+    check::eq(oci::auth_param(h, "scope"), "repository:a/b:pull,push")
+    check::eq(oci::auth_param(h, "nic"), "")
+end
+
+#[test]
+fn url_encoding_and_digest_filename() is
+    check::eq(oci::url_encode("repository:a/b:pull,push"), "repository%3Aa%2Fb%3Apull%2Cpush")
+    check::eq(oci::url_encode("AZaz09-_.~"), "AZaz09-_.~")
+    check::eq(oci::digest_to_filename("sha256:abc"), "sha256_abc")
+end
+
+#[test]
+fn layers_from_manifest_and_index_error() is
+    let p: json::Parsed = json::parse("{\"layers\":[{\"digest\":\"sha256:aa\",\"mediaType\":\"t\",\"size\":42}]}")
+    let r: oci::LayersResult = oci::layers_from_manifest(p.value)
+    test::assert_true(r.ok)
+    check::eq(r.layers[0].digest, "sha256:aa")
+    check::eq(text::istr(r.layers[0].size), "42")
+    let idx: json::Parsed = json::parse("{\"manifests\":[]}")
+    test::assert_false(oci::layers_from_manifest(idx.value).ok)
+end
+
+fn main() is
+end

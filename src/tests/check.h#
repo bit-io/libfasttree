@@ -1,0 +1,21 @@
+mod sys
+use "std -> test" from "test"
+
+;; Asercje na napisach. `std -> test`::assert_eq przyjmuje `any` i w backendzie
+;; LLVM H# 0.9 porównuje napisy po WSKAŹNIKU, nie po treści — dwa równe napisy
+;; z różnych miejsc kończą jako "failed: expected X actual X". Tu porównujemy
+;; typowane `string` (strcmp) i dopiero wtedy wołamy std.
+
+pub fn eq(actual: string, expected: string) is
+    if actual != expected is
+        sys::eprint("assert_eq failed:\n  expected: " + expected + "\n  actual:   " + actual)
+        test::assert_true(false)
+    end
+end
+
+pub fn ne(actual: string, unexpected: string) is
+    if actual == unexpected is
+        sys::eprint("assert_ne failed: oba równe '" + actual + "'")
+        test::assert_true(false)
+    end
+end

@@ -1,0 +1,66 @@
+use "std -> test" from "test"
+use "std -> env" from "env"
+mod check
+mod blake3
+mod hashing
+
+;; Wektory referencyjne policzone oficjalną implementacją BLAKE3 (Python
+;; `blake3`) dla wejścia bajt[i] = i mod 251.
+
+fn pat(n: int) -> [int] is
+    let mut a: [int] = []
+    let mut i: int = 0
+    while i < n is
+        a.push(i % 251)
+        i += 1
+    end
+    return a
+end
+
+fn hx(n: int) -> string is
+    return hashing::hex_of(blake3::hash(pat(n)))
+end
+
+#[test]
+fn empty_input() is
+    check::eq(hashing::hex_of(blake3::hash([])), "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262")
+end
+
+#[test]
+fn abc_vector() is
+    check::eq(hashing::hash_bytes([97, 98, 99]), "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85")
+end
+
+#[test]
+fn single_chunk_sizes() is
+    check::eq(hx(1), "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213")
+    check::eq(hx(63), "e9bc37a594daad83be9470df7f7b3798297c3d834ce80ba85d6e207627b7db7b")
+    check::eq(hx(64), "4eed7141ea4a5cd4b788606bd23f46e212af9cacebacdc7d1f4c6dc7f2511b98")
+    check::eq(hx(65), "de1e5fa0be70df6d2be8fffd0e99ceaa8eb6e8c93a63f2d8d1c30ecb6b263dee")
+    check::eq(hx(1023), "10108970eeda3eb932baac1428c7a2163b0e924c9a9e25b35bba72b28f70bd11")
+    check::eq(hx(1024), "42214739f095a406f3fc83deb889744ac00df831c10daa55189b5d121c855af7")
+end
+
+#[test]
+fn multi_chunk_trees() is
+    check::eq(hx(1025), "d00278ae47eb27b34faecf67b4fe263f82d5412916c1ffd97c8cb7fb814b8444")
+    check::eq(hx(2048), "e776b6028c7cd22a4d0ba182a8bf62205d2ef576467e838ed6f2529b85fba24a")
+    check::eq(hx(2049), "5f4d72f40d7a5f82b15ca2b2e44b1de3c2ef86c426c95c1af0b6879522563030")
+    check::eq(hx(3072), "b98cb0ff3623be03326b373de6b9095218513e64f1ee2edd2525c7ad1e5cffd2")
+    check::eq(hx(5000), "ee78d92070de3df1c57c37002abf0a6b1a6589acdeef4d8ffac7cf3d9e8f2836")
+    check::eq(hx(31744), "62b6960e1a44bcc1eb1a611a8d6235b6b4b78f32e7abc4fb4c6cdcce94895c47")
+    check::eq(hx(100000), "d93c23eedaf165a7e0be908ba86f1a7a520d568d2d13cde787c8580c5c72cc54")
+end
+
+#[test]
+fn hex_roundtrip_and_validation() is
+    let h: string = hx(10)
+    test::assert_true(hashing::is_valid_hash(h))
+    test::assert_false(hashing::is_valid_hash("zz"))
+    test::assert_false(hashing::is_valid_hash(h + "0"))
+    let raw: [int] = hashing::hex_decode(h)
+    check::eq(hashing::hex_of(raw), h)
+end
+
+fn main() is
+end

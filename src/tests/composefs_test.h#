@@ -1,0 +1,84 @@
+use "std -> test" from "test"
+use "std -> env" from "env"
+use "std -> fs" from "fs"
+mod check
+mod text
+mod sys
+mod composefs
+mod ioengine
+
+;; Testy wykrywania możliwości środowiska — muszą przechodzić zawsze, niezależnie
+;; od tego, czy host ma device-mapper, fs-verity, composefs czy veritysetup.
+;; Pełne `dm_verity_open`/`mount_verified` na prawdziwym jądrze są w CI
+;; (job `full-integration`).
+
+#[test]
+fn device_mapper_check_matches_control_node() is
+    test::assert_true(composefs::device_mapper_available() == fs::exists("/dev/mapper/control"))
+end
+
+#[test]
+fn fs_verity_check_never_crashes() is
+    let r: bool = composefs::fs_verity_kernel_support()
+    test::assert_true(r || !r)
+end
+
+#[test]
+fn missing_tool_gives_readable_error() is
+    let e: string = composefs::require_tool2("fasttree-nie-ma-takiego-narzedzia")
+    test::assert_true(text::contains(e, "Brak narzędzia"))
+end
+
+#[test]
+fn fake_composefs_binary_is_detected_by_banner() is
+    ;; atrapa o nazwie mkcomposefs BEZ właściwego bannera musi zostać odrzucona,
+    ;; a narzędzie z bannerem "Usage: mkcomposefs" zaakceptowane
+    let dir: string = text::path_join(sys::tmp_dir(), "fasttree-h-fake-" + text::istr(sys::pid()))
+    sys::rm_rf(dir)
+    fs::mkdir(dir)
+    let old_path: string = env::get("PATH")
+    env::set("PATH", dir + ":" + old_path)
+    let w: bool = fs::write(text::path_join(dir, "mkcomposefs"), "#!/bin/sh\necho nie jestem composefs\n")
+    let c: sys::Exec = sys::exec("chmod +x " + sys::sq(text::path_join(dir, "mkcomposefs")))
+    let bad: string = composefs::require_tool("mkcomposefs")
+    test::assert_true(text::contains(bad, "nie wygląda jak composefs"))
+    let w2: bool = fs::write(text::path_join(dir, "mkcomposefs"), "#!/bin/sh\necho 'Usage: mkcomposefs [OPTION]'\n")
+    let good: string = composefs::require_tool("mkcomposefs")
+    check::eq(good, "")
+    env::set("PATH", old_path)
+    sys::rm_rf(dir)
+end
+
+#[test]
+fn dm_verity_open_fast_fails_without_device_mapper() is
+    if sys::have_tool("veritysetup") && sys::have_tool("losetup") && !composefs::device_mapper_available() is
+        let r: composefs::CfsResult = composefs::dm_verity_open("/nieistniejacy.img", "/nieistniejacy.hash", "0000000000000000000000000000000000000000000000000000000000000000", "fasttree-test-verity")
+        test::assert_false(r.ok)
+        test::assert_true(text::contains(r.error, "device-mapper"))
+    end
+end
+
+#[test]
+fn ioengine_concat_and_batch_roundtrip() is
+    let dir: string = text::path_join(sys::tmp_dir(), "fasttree-h-io-" + text::istr(sys::pid()))
+    sys::rm_rf(dir)
+    fs::mkdir(dir)
+    let eng: ioengine::IoEngine = ioengine::default_engine()
+    let jobs: [ioengine::IoJob] = [
+        ioengine::IoJob { path: text::path_join(dir, "a"), data: [104, 105] },
+        ioengine::IoJob { path: text::path_join(dir, "b"), data: [0, 255, 1] }]
+    let done: int = ioengine::write_batch(eng, jobs)
+    check::eq(text::istr(done), "2")
+    let rd: [[int]] = ioengine::read_batch(eng, [text::path_join(dir, "a"), text::path_join(dir, "b")])
+    let second: [int] = rd[1]
+    check::eq(text::istr(second[1]), "255")
+    check::eq(text::istr(second.len()), "3")
+    test::assert_true(ioengine::concat_files([text::path_join(dir, "a"), text::path_join(dir, "b")], text::path_join(dir, "ab")))
+    check::eq(text::istr(fs::size(text::path_join(dir, "ab"))), "5")
+    test::assert_true(ioengine::concat_files([], text::path_join(dir, "empty")))
+    check::eq(text::istr(fs::size(text::path_join(dir, "empty"))), "0")
+    sys::rm_rf(dir)
+end
+
+fn main() is
+end

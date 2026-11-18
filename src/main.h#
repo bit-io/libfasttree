@@ -1,0 +1,14 @@
+use "std -> env" from "env"
+mod cli
+
+fn main() -> int is
+    let argv: [string] = env::args()
+    let n: int = argv.len()
+    let mut args: [string] = []
+    let mut i: int = 1
+    while i < n is
+        args.push(argv[i])
+        i += 1
+    end
+    return cli::run(args)
+end

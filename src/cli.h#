@@ -1,0 +1,422 @@
+mod text
+mod hashing
+mod chunker
+mod sys
+mod json
+mod store
+mod manifest
+mod layers
+mod gc
+mod ioengine
+mod oci
+mod composefs
+mod overlay
+use "std -> fs" from "fs"
+
+;; CLI `fasttree` — port cli.nim. Każda komenda zwraca kod wyjścia procesu
+;; (0 = sukces); błędy idą na stderr jako "[fasttree] błąd: ...".
+
+pub fn root_dir() -> string is
+    return sys::getenv_or("FASTTREE_ROOT", "/var/lib/fasttree")
+end
+
+fn say(msg: string) is
+    write(msg)
+end
+
+fn fail(msg: string) -> int is
+    sys::eprint("[fasttree] błąd: " + msg)
+    return 1
+end
+
+pub fn ensure_layout() is
+    let root: string = root_dir()
+    fs::mkdir(text::path_join(root, "store"))
+    fs::mkdir(text::path_join(root, "deployments"))
+    fs::mkdir(text::path_join(root, "manifests"))
+    fs::mkdir(text::path_join(root, "layers-cache"))
+end
+
+;; Nazwa manifestu/wdrożenia na dysku: ':' -> '_' (np. "@sha256:...").
+pub fn sanitize_tag(reference: string) -> string is
+    return text::join(text::split(reference, ":"), "_")
+end
+
+pub fn manifest_path(tag: string) -> string is
+    return text::path_join(text::path_join(root_dir(), "manifests"), tag + ".json")
+end
+
+pub fn cmd_pull(image_ref: string) -> int is
+    ensure_layout()
+    let root: string = root_dir()
+    say("[fasttree] pull " + image_ref)
+    let so: store::OpenResult = store::open(text::path_join(root, "store"))
+    if !so.ok is return fail(so.error) end
+    let rr: oci::RefResult = oci::parse_image_ref(image_ref)
+    if !rr.ok is return fail(rr.error) end
+    let tag: string = sanitize_tag(rr.ref.reference)
+
+    ;; 1. Warstwy (cache blobów OCI niezależny od dedupu chunków).
+    let res: oci::ResolveResult = oci::resolve_image_layers(rr.ref, text::path_join(root, "layers-cache"))
+    if !res.ok is return fail(res.error) end
+    let total: int = res.layers.len()
+    let mut fresh: int = 0
+    let mut paths: [string] = []
+    let mut i: int = 0
+    while i < total is
+        let rl: oci::ResolvedLayer = res.layers[i]
+        let cached: bool = rl.was_cached
+        if !cached is fresh += 1 end
+        paths.push(rl.path)
+        i += 1
+    end
+    say("[fasttree] " + text::istr(total) + " warstw łącznie, " + text::istr(fresh) + " nowo pobranych (" + text::istr(total - fresh) + " już w cache)")
+
+    ;; 2. Rozpakuj i scal warstwy (whiteouty OCI).
+    let work: string = text::path_join(text::path_join(sys::tmp_dir(), "fasttree-pull"), tag)
+    sys::rm_rf(work)
+    let merged: string = text::path_join(work, "merged")
+    let lr: layers::LayerResult = layers::materialize_layers(paths, text::path_join(work, "layers"), merged)
+    if !lr.ok is return fail(lr.error) end
+    say("[fasttree] warstwy scalone w " + merged)
+
+    ;; 3. Manifest: FastCDC + zapis chunków do CAS.
+    let br: manifest::BuildResult = manifest::build_default(merged, so.store)
+    if !br.ok is return fail(br.error) end
+    let n: int = br.manifest.entries.len()
+    say("[fasttree] manifest zbudowany: root=" + br.manifest.root + ", " + text::istr(n) + " wpisów")
+    let mpath: string = manifest_path(tag)
+    if !fs::write(mpath, manifest::to_json(br.manifest)) is return fail("nie można zapisać " + mpath) end
+    say("[fasttree] zapisano " + mpath + " — gotowe do 'fasttree deploy " + tag + "'")
+    sys::rm_rf(work)
+    return 0
+end
+
+pub fn cmd_status(show_diff: bool) -> int is
+    ensure_layout()
+    let root: string = root_dir()
+    let link: string = text::path_join(root, "current")
+    if !sys::exists_any(link) is
+        say("[fasttree] brak aktywnego wdrożenia")
+        return 0
+    end
+    say("[fasttree] aktywne wdrożenie: " + sys::readlink(link))
+    if !show_diff is return 0 end
+    let cur_f: string = text::path_join(root, "CURRENT_TAG")
+    let prev_f: string = text::path_join(root, "PREVIOUS_TAG")
+    if !fs::exists(cur_f) is
+        say("[fasttree] --diff: brak CURRENT_TAG — nie wiem, który manifest jest aktywny")
+        return 0
+    end
+    if !fs::exists(prev_f) is
+        say("[fasttree] --diff: brak PREVIOUS_TAG — to pierwsze wdrożenie w tym repo, nie ma z czym porównać")
+        return 0
+    end
+    let cur: string = text::trim(fs::read(cur_f))
+    let prev: string = text::trim(fs::read(prev_f))
+    if cur == prev is
+        say("[fasttree] --diff: current i previous to ten sam tag ('" + cur + "') — brak zmian")
+        return 0
+    end
+    let old_m: manifest::ParseResult = manifest::load(manifest_path(prev))
+    if !old_m.ok is
+        say("[fasttree] --diff: " + old_m.error)
+        return 0
+    end
+    let new_m: manifest::ParseResult = manifest::load(manifest_path(cur))
+    if !new_m.ok is
+        say("[fasttree] --diff: " + new_m.error)
+        return 0
+    end
+    let d: [manifest::DiffEntry] = manifest::diff(old_m.manifest, new_m.manifest)
+    let dn: int = d.len()
+    if dn == 0 is
+        say("[fasttree] --diff " + prev + " -> " + cur + ": drzewa identyczne (root-hash bez zmian)")
+        return 0
+    end
+    say("[fasttree] --diff " + prev + " -> " + cur + ": " + text::istr(dn) + " zmienionych ścieżek")
+    let mut i: int = 0
+    while i < dn is
+        let e: manifest::DiffEntry = d[i]
+        i += 1
+        let kind: string = e.kind
+        let p: string = e.path
+        if kind == "added" is
+            say("  + " + p + "  (" + text::istr(e.new_chunks) + " chunków)")
+        else if kind == "removed" is
+            say("  - " + p + "  (" + text::istr(e.old_chunks) + " chunków)")
+        else is
+            say("  ~ " + p + "  (" + text::istr(e.old_chunks) + " -> " + text::istr(e.new_chunks) + " chunków, " + text::istr(e.reused_chunks) + " reużytych)")
+        end
+    end
+    return 0
+end
+
+pub fn cmd_deploy(tag: string, atomic: bool) -> int is
+    ensure_layout()
+    let root: string = root_dir()
+    let so: store::OpenResult = store::open(text::path_join(root, "store"))
+    if !so.ok is return fail(so.error) end
+    let mpath: string = manifest_path(tag)
+    if !fs::exists(mpath) is
+        say("[fasttree] brak manifestu dla '" + tag + "' — najpierw 'fasttree pull'")
+        return 0
+    end
+    let pr: manifest::ParseResult = manifest::load(mpath)
+    if !pr.ok is return fail(pr.error) end
+    let deploy_dir: string = text::path_join(text::path_join(root, "deployments"), tag)
+    let image: string = deploy_dir + ".erofs"
+    let br: composefs::CfsResult = composefs::build_image(pr.manifest, so.store, deploy_dir + ".materialized", image)
+    if !br.ok is return fail(br.error) end
+    let digest: string = br.value
+    if !fs::write(image + ".digest", digest) is return fail("nie można zapisać " + image + ".digest") end
+    say("[fasttree] obraz composefs zbudowany, digest=" + digest)
+
+    ;; dm-verity: hash-tree liczony od razu przy deploy, root hash obok obrazu.
+    let v: composefs::DmVerityInfo = composefs::dm_verity_format(image)
+    if !v.ok is return fail(v.error) end
+    if !fs::write(image + ".veritysum", v.root_hash) is return fail("nie można zapisać " + image + ".veritysum") end
+    say("[fasttree] dm-verity hash-tree obliczony, root=" + v.root_hash)
+
+    let link: string = text::path_join(root, "current")
+    if atomic is
+        ;; Atomowy A/B swap: symlink pod tymczasową nazwą + rename(2).
+        let tmp: string = link + ".tmp"
+        if sys::exists_any(tmp) is sys::rm_f(tmp) end
+        if !sys::symlink(image, tmp) is return fail("nie można utworzyć symlinku " + tmp) end
+        fs::rename(tmp, link)
+        say("[fasttree] wdrożono " + tag + " atomowo, current -> " + image)
+    else is
+        if sys::exists_any(link) is sys::rm_f(link) end
+        if !sys::symlink(image, link) is return fail("nie można utworzyć symlinku " + link) end
+        say("[fasttree] wdrożono " + tag + ", current -> " + image)
+    end
+
+    ;; PREVIOUS_TAG musi być zapisany PRZED nadpisaniem CURRENT_TAG.
+    let cur_f: string = text::path_join(root, "CURRENT_TAG")
+    if fs::exists(cur_f) is
+        let prev: string = text::trim(fs::read(cur_f))
+        if prev != tag is
+            let w: bool = fs::write(text::path_join(root, "PREVIOUS_TAG"), prev)
+        end
+    end
+    let w2: bool = fs::write(cur_f, tag)
+    return 0
+end
+
+pub fn cmd_gc(dry_run: bool) -> int is
+    ensure_layout()
+    let mut flag: string = ""
+    if dry_run is flag = " --dry-run" end
+    say("[fasttree] gc" + flag + ": liczę live-set (CURRENT_TAG + pins.json)...")
+    let r: gc::GcResult = gc::run_gc(root_dir(), dry_run)
+    if !r.ok is return fail(r.error) end
+    let mut verb: string = "usunięto"
+    if dry_run is verb = "zostałoby usuniętych" end
+    say("[fasttree] przeskanowano " + text::istr(r.scanned_objects) + " obiektów, " + text::istr(r.live_objects) + " żywych, " + verb + " " + text::istr(r.deleted_objects) + " (" + text::istr(r.freed_bytes) + " B)")
+    return 0
+end
+
+pub fn cmd_pin(tag: string, note: string) -> int is
+    ensure_layout()
+    let pins_path: string = text::path_join(root_dir(), "pins.json")
+    let mut pins: json::J = json::jarr([])
+    if fs::exists(pins_path) is
+        let p: json::Parsed = json::parse(fs::read(pins_path))
+        if !p.ok is return fail("pins.json: " + p.error) end
+        pins = p.value
+    end
+    let o: json::J = json::jobj()
+    json::set(o, "tag", json::jstr(tag))
+    json::set(o, "note", json::jstr(note))
+    json::set(o, "pinnedAt", json::jstr(text::trim(sys::exec("date -u +%Y-%m-%dT%H:%M:%SZ").out)))
+    pins.items.push(o)
+    if !fs::write(pins_path, json::to_pretty(pins)) is return fail("nie można zapisać " + pins_path) end
+    say("[fasttree] przypięto '" + tag + "': " + note)
+    return 0
+end
+
+pub fn cmd_overlay_create(name: string, ephemeral: bool) -> int is
+    ensure_layout()
+    let root: string = root_dir()
+    let cur_f: string = text::path_join(root, "CURRENT_TAG")
+    if !fs::exists(cur_f) is
+        say("[fasttree] brak aktywnego wdrożenia (CURRENT_TAG) — najpierw 'fasttree deploy'")
+        return 0
+    end
+    let tag: string = text::trim(fs::read(cur_f))
+    let image: string = text::path_join(text::path_join(root, "deployments"), tag + ".erofs")
+    if !fs::exists(image) is
+        say("[fasttree] brak obrazu dla aktywnego wdrożenia '" + tag + "' (" + image + ")")
+        return 0
+    end
+    ;; Dwa mounty: baza (read-only composefs) + overlay.
+    let base: string = text::path_join(text::path_join(root, "overlay-base"), tag)
+    let marker: string = text::path_join(base, ".mounted")
+    if !fs::is_dir(base) || !fs::exists(marker) is
+        let m: composefs::CfsResult = composefs::mount_image(image, base, "")
+        if !m.ok is return fail(m.error) end
+        let w: bool = fs::write(marker, "")
+        say("[fasttree] zamontowano bazowy obraz '" + tag + "' (read-only) w " + base)
+    end
+    let mountpoint: string = text::path_join(text::path_join(root, "overlay-mounts"), name)
+    let mut ov: overlay::OverlayResult = overlay::new_persistent_overlay(base, root, name, mountpoint)
+    let mut kind: string = "trwały"
+    if ephemeral is
+        ov = overlay::new_tmp_overlay(base, mountpoint, 512)
+        kind = "ulotny"
+    end
+    if !ov.ok is return fail(ov.error) end
+    say("[fasttree] overlay '" + name + "' (" + kind + ") zamontowany w " + ov.overlay.mountpoint)
+    return 0
+end
+
+pub fn cmd_overlay_remove(name: string) -> int is
+    ensure_layout()
+    let root: string = root_dir()
+    let mountpoint: string = text::path_join(text::path_join(root, "overlay-mounts"), name)
+    let eph: bool = fs::is_dir(mountpoint + ".tmpfs")
+    let mut upper: string = text::path_join(text::path_join(text::path_join(root, "overlays"), name), "upper")
+    let mut tmpfs: string = ""
+    if eph is
+        upper = text::path_join(mountpoint + ".tmpfs", "upper")
+        tmpfs = mountpoint + ".tmpfs"
+    end
+    let ov: overlay::Overlay = overlay::Overlay { lowerdir: "", upperdir: upper, workdir: "",
+        mountpoint: mountpoint, ephemeral: eph, tmpfs_mount: tmpfs }
+    let e: string = overlay::unmount_overlay(ov)
+    if e != "" is return fail(e) end
+    let mut suffix: string = " (dane trwałe zachowane)"
+    if eph is suffix = " (dane ulotne — bezpowrotnie usunięte)" end
+    say("[fasttree] overlay '" + name + "' odmontowany" + suffix)
+    return 0
+end
+
+pub fn cmd_overlay_list() -> int is
+    ensure_layout()
+    let ovs: [overlay::OverlayInfo] = overlay::list_active_overlays(root_dir())
+    let n: int = ovs.len()
+    if n == 0 is
+        say("[fasttree] brak overlayów")
+        return 0
+    end
+    say("[fasttree] " + text::istr(n) + " overlay(ów):")
+    let mut i: int = 0
+    while i < n is
+        let o: overlay::OverlayInfo = ovs[i]
+        i += 1
+        let mut kind: string = "trwały"
+        if o.ephemeral is kind = "ulotny" end
+        let mut state: string = "NIEZAMONTOWANY (katalog istnieje, ale mount nieaktywny)"
+        if o.mounted is state = "zamontowany" end
+        say("  " + o.name + "  [" + kind + ", " + state + "]  " + o.mountpoint)
+    end
+    return 0
+end
+
+pub fn cmd_overlay_diff(name: string) -> int is
+    ensure_layout()
+    let ovs: [overlay::OverlayInfo] = overlay::list_active_overlays(root_dir())
+    let n: int = ovs.len()
+    let mut i: int = 0
+    while i < n is
+        let info: overlay::OverlayInfo = ovs[i]
+        i += 1
+        if info.name == name is
+            let mut tmpfs: string = ""
+            if info.ephemeral is tmpfs = info.mountpoint + ".tmpfs" end
+            let ov: overlay::Overlay = overlay::Overlay { lowerdir: "", upperdir: info.upperdir, workdir: "",
+                mountpoint: info.mountpoint, ephemeral: info.ephemeral, tmpfs_mount: tmpfs }
+            let ch: [string] = overlay::list_changes(ov)
+            let cn: int = ch.len()
+            if cn == 0 is
+                say("[fasttree] overlay '" + name + "': brak zmian względem bazy")
+            else is
+                say("[fasttree] overlay '" + name + "': " + text::istr(cn) + " zmienionych ścieżek")
+                let mut k: int = 0
+                while k < cn is
+                    say("  " + ch[k])
+                    k += 1
+                end
+            end
+            return 0
+        end
+    end
+    say("[fasttree] nie znaleziono overlaya '" + name + "' (patrz 'fasttree overlay list')")
+    return 0
+end
+
+pub fn usage() -> string is
+    return "fasttree — content-addressable następca OSTree\n\nUżycie:\n  fasttree pull <registry>/<repo>:<tag>\n  fasttree status [--diff]\n  fasttree deploy <tag> [--atomic]\n  fasttree pin <tag> \"<notatka>\"\n  fasttree gc [--dry-run]\n  fasttree overlay create <nazwa> [--ephemeral]\n  fasttree overlay remove <nazwa>\n  fasttree overlay list\n  fasttree overlay diff <nazwa>"
+end
+
+fn has_flag(args: [string], flag: string) -> bool is
+    for a in args is
+        if a == flag is return true end
+    end
+    return false
+end
+
+;; Dispatch: `args` bez nazwy programu. Zwraca kod wyjścia.
+pub fn run(args: [string]) -> int is
+    let n: int = args.len()
+    if n == 0 is
+        say(usage())
+        return 1
+    end
+    let cmd: string = args[0]
+    if cmd == "pull" is
+        if n < 2 is
+            say(usage())
+            return 1
+        end
+        return cmd_pull(args[1])
+    end
+    if cmd == "status" is return cmd_status(has_flag(args, "--diff")) end
+    if cmd == "deploy" is
+        if n < 2 is
+            say(usage())
+            return 1
+        end
+        return cmd_deploy(args[1], has_flag(args, "--atomic"))
+    end
+    if cmd == "pin" is
+        if n < 3 is
+            say(usage())
+            return 1
+        end
+        return cmd_pin(args[1], args[2])
+    end
+    if cmd == "gc" is return cmd_gc(has_flag(args, "--dry-run")) end
+    if cmd == "overlay" is
+        if n < 2 is
+            say(usage())
+            return 1
+        end
+        let sub: string = args[1]
+        if sub == "create" is
+            if n < 3 is
+                say(usage())
+                return 1
+            end
+            return cmd_overlay_create(args[2], has_flag(args, "--ephemeral"))
+        end
+        if sub == "remove" is
+            if n < 3 is
+                say(usage())
+                return 1
+            end
+            return cmd_overlay_remove(args[2])
+        end
+        if sub == "list" is return cmd_overlay_list() end
+        if sub == "diff" is
+            if n < 3 is
+                say(usage())
+                return 1
+            end
+            return cmd_overlay_diff(args[2])
+        end
+    end
+    say(usage())
+    return 1
+end

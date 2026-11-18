@@ -1,0 +1,63 @@
+use "std -> test" from "test"
+use "std -> env" from "env"
+mod check
+use "std -> fs" from "fs"
+mod text
+mod sys
+mod layers
+
+fn sh(cmd: string) is
+    let r: sys::Exec = sys::exec(cmd)
+    check::eq(text::istr(r.code), "0")
+end
+
+;; Dwie warstwy: pierwsza tworzy pliki, druga je modyfikuje przez whiteout
+;; pojedynczego pliku i opaque whiteout katalogu — semantyka OCI image spec.
+#[test]
+fn whiteouts_and_opaque_dirs() is
+    let base: string = text::path_join(sys::tmp_dir(), "fasttree-h-layers-" + text::istr(sys::pid()))
+    sys::rm_rf(base)
+    let l1: string = base + "/l1src"
+    let l2: string = base + "/l2src"
+    sh("mkdir -p " + l1 + "/etc " + l1 + "/lib " + l1 + "/bin " + l2 + "/etc " + l2 + "/lib")
+    sh("echo v1 > " + l1 + "/etc/os; echo old > " + l1 + "/etc/old.conf; echo a > " + l1 + "/lib/a; echo b > " + l1 + "/lib/b")
+    sh("echo tool > " + l1 + "/bin/tool; chmod 755 " + l1 + "/bin/tool; ln -s bin/tool " + l1 + "/ln")
+    sh("echo hl > " + l1 + "/hl1; ln " + l1 + "/hl1 " + l1 + "/hl2")
+    sh("echo v2 > " + l2 + "/etc/os; : > " + l2 + "/etc/.wh.old.conf; : > " + l2 + "/lib/.wh..wh..opq; echo c > " + l2 + "/lib/c")
+    sh("tar -cf " + base + "/l1.tar -C " + l1 + " . && tar -cf " + base + "/l2.tar -C " + l2 + " .")
+    let dest: string = base + "/merged"
+    let r: layers::LayerResult = layers::materialize_layers([base + "/l1.tar", base + "/l2.tar"], base + "/work", dest)
+    test::assert_true(r.ok)
+    check::eq(text::trim(fs::read(dest + "/etc/os")), "v2")
+    test::assert_false(fs::exists(dest + "/etc/old.conf"))
+    test::assert_false(fs::exists(dest + "/lib/a"))
+    test::assert_false(fs::exists(dest + "/lib/b"))
+    check::eq(text::trim(fs::read(dest + "/lib/c")), "c")
+    test::assert_true(sys::is_symlink(dest + "/ln"))
+    check::eq(sys::readlink(dest + "/ln"), "bin/tool")
+    test::assert_true(sys::ok("test -x " + dest + "/bin/tool"))
+    test::assert_true(sys::ok("test " + dest + "/hl1 -ef " + dest + "/hl2"))
+    sys::rm_rf(base)
+end
+
+#[test]
+fn whiteout_helpers() is
+    test::assert_true(layers::is_whiteout(".wh.foo"))
+    test::assert_false(layers::is_whiteout(".wh..wh..opq"))
+    test::assert_true(layers::is_opaque(".wh..wh..opq"))
+    check::eq(layers::whiteout_target(".wh.foo"), "foo")
+end
+
+#[test]
+fn bad_tar_reports_error() is
+    let base: string = text::path_join(sys::tmp_dir(), "fasttree-h-badtar-" + text::istr(sys::pid()))
+    sys::rm_rf(base)
+    fs::mkdir(base)
+    let w: bool = fs::write(base + "/x.tar", "to nie jest tar")
+    let r: layers::LayerResult = layers::extract_layer_tar(base + "/x.tar", base + "/out")
+    test::assert_false(r.ok)
+    sys::rm_rf(base)
+end
+
+fn main() is
+end

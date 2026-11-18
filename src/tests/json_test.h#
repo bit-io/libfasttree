@@ -1,0 +1,66 @@
+use "std -> test" from "test"
+use "std -> env" from "env"
+mod check
+mod text
+mod hashing
+mod json
+
+#[test]
+fn roundtrip_pretty_and_compact() is
+    let o: json::J = json::jobj()
+    json::set(o, "n", json::jint(1234567))
+    json::set(o, "neg", json::jint(-5))
+    json::set(o, "s", json::jstr("a\"b\\c\nd\te"))
+    json::set(o, "arr", json::jarr([json::jstr("x"), json::jbool(true), json::jnull()]))
+    json::set(o, "empty_arr", json::jarr([]))
+    json::set(o, "empty_obj", json::jobj())
+    let pretty: string = json::to_pretty(o)
+    let p: json::Parsed = json::parse(pretty)
+    test::assert_true(p.ok)
+    check::eq(json::to_json(p.value), json::to_json(o))
+end
+
+#[test]
+fn pretty_format_matches_nim() is
+    let o: json::J = json::jobj()
+    json::set(o, "a", json::jint(1))
+    json::set(o, "l", json::jarr([json::jint(2)]))
+    let want: string = text::lbrace() + "
+  \"a\": 1,
+  \"l\": [
+    2
+  ]
+" + text::rbrace()
+    check::eq(json::to_pretty(o), want)
+end
+
+#[test]
+fn accessors_and_defaults() is
+    let p: json::Parsed = json::parse("{\"a\": 5, \"b\": \"x\", \"c\": [1,2,3]}")
+    test::assert_true(p.ok)
+    check::eq(text::istr(json::as_int(json::get(p.value, "a"), 0)), "5")
+    check::eq(json::as_str(json::get(p.value, "b"), "?"), "x")
+    check::eq(json::as_str(json::get(p.value, "zz"), "?"), "?")
+    test::assert_true(json::has(p.value, "c"))
+    test::assert_false(json::has(p.value, "q"))
+    check::eq(text::istr(json::count(json::get(p.value, "c"))), "3")
+end
+
+#[test]
+fn unicode_escape_and_utf8() is
+    let p: json::Parsed = json::parse("\"z\\u00f3\\u0142w\"")
+    test::assert_true(p.ok)
+    check::eq(p.value.s, "zółw")
+end
+
+#[test]
+fn rejects_malformed_input() is
+    test::assert_false(json::parse("{\"a\": [1, 2").ok)
+    test::assert_false(json::parse("{\"a\" 1}").ok)
+    test::assert_false(json::parse("[1,]").ok)
+    test::assert_false(json::parse("{} trailing").ok)
+    test::assert_false(json::parse("").ok)
+end
+
+fn main() is
+end

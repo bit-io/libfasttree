@@ -1,0 +1,103 @@
+use "std -> test" from "test"
+use "std -> env" from "env"
+mod check
+use "std -> fs" from "fs"
+mod text
+mod hashing
+mod chunker
+mod sys
+mod json
+mod store
+mod manifest
+
+fn make_tree(name: string) -> string is
+    let dir: string = text::path_join(sys::tmp_dir(), "fasttree-h-mt-" + name + "-" + text::istr(sys::pid()))
+    sys::rm_rf(dir)
+    fs::mkdir(text::path_join(dir, "a"))
+    let w1: bool = fs::write(text::path_join(dir, "a/f.txt"), "hello\n")
+    let w2: bool = fs::write(text::path_join(dir, "e.sh"), "#!/bin/sh\n")
+    let c: sys::Exec = sys::exec("chmod +x " + sys::sq(text::path_join(dir, "e.sh")) + " && ln -s a/f.txt " + sys::sq(text::path_join(dir, "l")))
+    return dir
+end
+
+#[test]
+fn root_matches_reference_merkle() is
+    ;; MROOT policzony niezależnie (Python + oficjalny blake3) dla tego drzewa.
+    let src: string = make_tree("root")
+    let root: string = src + ".store"
+    let o: store::OpenResult = store::open(root)
+    let b: manifest::BuildResult = manifest::build_default(src, o.store)
+    test::assert_true(b.ok)
+    check::eq(b.manifest.root, "cd442e222db300671b8ec1422ccaf8506d55587f24aea858638f16ca8208fd94")
+    check::eq(text::istr(b.manifest.entries.len()), "4")
+    sys::rm_rf(src)
+    sys::rm_rf(root)
+end
+
+#[test]
+fn modes_and_sorting() is
+    let src: string = make_tree("modes")
+    let o: store::OpenResult = store::open(src + ".store")
+    let b: manifest::BuildResult = manifest::build_default(src, o.store)
+    let es: [manifest::FileEntry] = b.manifest.entries
+    check::eq(es[0].path, "a")
+    check::eq(es[0].mode, "directory")
+    check::eq(es[1].path, "a/f.txt")
+    check::eq(es[2].path, "e.sh")
+    check::eq(es[2].mode, "executable")
+    check::eq(es[3].path, "l")
+    check::eq(es[3].mode, "symlink")
+    check::eq(es[3].link_target, "a/f.txt")
+    sys::rm_rf(src)
+    sys::rm_rf(src + ".store")
+end
+
+#[test]
+fn json_roundtrip_preserves_root() is
+    let src: string = make_tree("rt")
+    let o: store::OpenResult = store::open(src + ".store")
+    let b: manifest::BuildResult = manifest::build_default(src, o.store)
+    let txt: string = manifest::to_json(b.manifest)
+    let p: manifest::ParseResult = manifest::from_json(txt)
+    test::assert_true(p.ok)
+    check::eq(p.manifest.root, b.manifest.root)
+    check::eq(manifest::compute_root(p.manifest.entries), b.manifest.root)
+    check::eq(manifest::to_json(p.manifest), txt)
+    sys::rm_rf(src)
+    sys::rm_rf(src + ".store")
+end
+
+#[test]
+fn rejects_newer_and_missing_format_version() is
+    let p1: manifest::ParseResult = manifest::from_json("{\"formatVersion\": 99, \"root\": \"x\", \"entries\": []}")
+    test::assert_false(p1.ok)
+    test::assert_true(text::contains(p1.error, "formatVersion=99"))
+    let p2: manifest::ParseResult = manifest::from_json("{\"root\": \"x\", \"entries\": []}")
+    test::assert_false(p2.ok)
+    test::assert_true(text::contains(p2.error, "formatVersion"))
+end
+
+#[test]
+fn diff_detects_added_removed_modified() is
+    let src: string = make_tree("diff")
+    let o: store::OpenResult = store::open(src + ".store")
+    let m1: manifest::BuildResult = manifest::build_default(src, o.store)
+    let w1: bool = fs::write(text::path_join(src, "a/f.txt"), "changed\n")
+    let w2: bool = fs::write(text::path_join(src, "new.txt"), "n\n")
+    sys::rm_f(text::path_join(src, "e.sh"))
+    let m2: manifest::BuildResult = manifest::build_default(src, o.store)
+    let d: [manifest::DiffEntry] = manifest::diff(m1.manifest, m2.manifest)
+    let mut kinds: [string] = []
+    for e in d is
+        kinds.push(e.kind + ":" + e.path)
+    end
+    test::assert_true(text::join(kinds, ",").contains("modified:a/f.txt"))
+    test::assert_true(text::join(kinds, ",").contains("added:new.txt"))
+    test::assert_true(text::join(kinds, ",").contains("removed:e.sh"))
+    check::eq(text::istr(d.len()), "3")
+    sys::rm_rf(src)
+    sys::rm_rf(src + ".store")
+end
+
+fn main() is
+end

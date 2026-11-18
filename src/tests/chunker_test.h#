@@ -1,0 +1,106 @@
+use "std -> test" from "test"
+use "std -> env" from "env"
+mod check
+mod text
+mod chunker
+
+fn noise(n: int, seed0: int) -> [int] is
+    ;; deterministyczny LCG — dane "losowe", żeby FastCDC miał gdzie ciąć
+    let mut a: [int] = []
+    let mut s: int = seed0
+    let mut i: int = 0
+    while i < n is
+        s = (s * 1103515245 + 12345) % 2147483648
+        let v: int = (s / 65536) % 256
+        a.push(v)
+        i += 1
+    end
+    return a
+end
+
+#[test]
+fn empty_input_gives_no_chunks() is
+    let rs: [chunker::Range] = chunker::chunk_ranges([], chunker::default_config())
+    check::eq(text::istr(rs.len()), "0")
+end
+
+#[test]
+fn small_input_is_one_chunk() is
+    let d: [int] = noise(1000, 1)
+    let rs: [chunker::Range] = chunker::chunk_ranges(d, chunker::default_config())
+    check::eq(text::istr(rs.len()), "1")
+    let r: chunker::Range = rs[0]
+    check::eq(text::istr(r.size), "1000")
+end
+
+#[test]
+fn chunks_tile_the_input_and_respect_bounds() is
+    let n: int = 400000
+    let d: [int] = noise(n, 7)
+    let cfg: chunker::ChunkerConfig = chunker::default_config()
+    let rs: [chunker::Range] = chunker::chunk_ranges(d, cfg)
+    let c: int = rs.len()
+    test::assert_true(c > 4)
+    let mut total: int = 0
+    let mut i: int = 0
+    let min_sz: int = cfg.min_size
+    let max_sz: int = cfg.max_size
+    while i < c is
+        let r: chunker::Range = rs[i]
+        let off: int = r.offset
+        let sz: int = r.size
+        check::eq(text::istr(off), text::istr(total))
+        test::assert_true(sz <= max_sz)
+        if i < c - 1 is test::assert_true(sz >= min_sz) end
+        total += sz
+        i += 1
+    end
+    check::eq(text::istr(total), text::istr(n))
+end
+
+#[test]
+fn deterministic_and_content_defined() is
+    let d: [int] = noise(300000, 99)
+    let a: [chunker::Range] = chunker::chunk_ranges(d, chunker::default_config())
+    let b: [chunker::Range] = chunker::chunk_ranges(d, chunker::default_config())
+    check::eq(text::istr(a.len()), text::istr(b.len()))
+    ;; wstawka na początku przesuwa dane, ale większość granic (liczonych od
+    ;; końca) musi się zachować — sedno content-defined chunkingu.
+    let mut shifted: [int] = [1, 2, 3, 4, 5, 6, 7]
+    for x in d is
+        shifted.push(x)
+    end
+    let c: [chunker::Range] = chunker::chunk_ranges(shifted, chunker::default_config())
+    let an: int = a.len()
+    let cn: int = c.len()
+    let last_a: chunker::Range = a[an - 1]
+    let last_c: chunker::Range = c[cn - 1]
+    check::eq(text::istr(last_a.size), text::istr(last_c.size))
+end
+
+;; Granice policzone referencyjnym modelem w Pythonie (ta sama tablica gear,
+;; ten sam xorshift64, te same progi) dla wejścia noise(300000, 5) — gwarantuje
+;; zgodność z wersją Nim.
+#[test]
+fn matches_reference_model() is
+    let d: [int] = noise(300000, 5)
+    let rs: [chunker::Range] = chunker::chunk_ranges(d, chunker::default_config())
+    let n: int = rs.len()
+    check::eq(text::istr(n), "15")
+    let want: [int] = [23439, 4625, 36189, 19861, 24030]
+    let mut i: int = 0
+    while i < 5 is
+        let r: chunker::Range = rs[i]
+        let sz: int = r.size
+        check::eq(text::istr(sz), text::istr(want[i]))
+        i += 1
+    end
+    let last: chunker::Range = rs[14]
+    let lo: int = last.offset
+    let ls: int = last.size
+    check::eq(text::istr(lo), "288099")
+    check::eq(text::istr(ls), "11901")
+end
+
+fn main() is
+end

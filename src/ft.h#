@@ -1,0 +1,476 @@
+mod text
+mod hashing
+mod chunker
+mod sys
+mod json
+mod store
+mod manifest
+mod layers
+mod gc
+mod ioengine
+mod oci
+mod composefs
+mod overlay
+mod cli
+use "std -> fs" from "fs"
+
+;; ═══════════════════════════════════════════════════════════════════════════
+;;  Stabilne API C (ABI) biblioteki fasttree.
+;;
+;;  Kompilator H# eksportuje `pub fn` modułu `ft` jako symbole `ft_<nazwa>`
+;;  (int -> int64_t, bool -> bool, string -> const char*). Ten moduł jest
+;;  JEDYNĄ powierzchnią ABI — wszystko inne w bibliotece to wewnętrzne API
+;;  H# (moduły store, manifest, ...), widoczne z kodu H# przez `mod`.
+;;
+;;  Konwencje (BEZSTANOWE — H# 0.9 nie ma mutowalnych globali, więc nie ma
+;;  uchwytów ani `last_error`):
+;;    * store/manifest są identyfikowane ścieżką (`root`), nie uchwytem;
+;;    * funkcje zwracające wynik złożony zwracają napis JSON — kopertę
+;;      {"ok":true,...} albo {"ok":false,"error":"..."};
+;;    * dane binarne przekraczają granicę FFI jako hex (napisy C kończą się
+;;      NUL-em) albo — lepiej, dla dużych danych — jako ścieżki plików;
+;;    * zwrócone napisy należą do runtime'u H# — NIE wolno ich zwalniać
+;;      (`free`); skopiuj je od razu (runtime H# 0.9 nie ma GC i trzyma je
+;;      do końca procesu).
+;; ═══════════════════════════════════════════════════════════════════════════
+
+pub fn abi_version() -> int is return 1 end
+pub fn format_version() -> int is return 1 end
+pub fn hash_algo() -> string is return hashing::algo_name() end
+
+fn env_ok() -> json::J is
+    let o: json::J = json::jobj()
+    json::set(o, "ok", json::jbool(true))
+    return o
+end
+
+fn fail(msg: string) -> string is
+    let o: json::J = json::jobj()
+    json::set(o, "ok", json::jbool(false))
+    json::set(o, "error", json::jstr(msg))
+    return json::to_json(o)
+end
+
+fn done(o: json::J) -> string is
+    return json::to_json(o)
+end
+
+fn cfg_of(min_size: int, avg_size: int, max_size: int) -> chunker::ChunkerConfig is
+    let d: chunker::ChunkerConfig = chunker::default_config()
+    let mut mn: int = d.min_size
+    let mut av: int = d.avg_size
+    let mut mx: int = d.max_size
+    if min_size > 0 is mn = min_size end
+    if avg_size > 0 is av = avg_size end
+    if max_size > 0 is mx = max_size end
+    return chunker::ChunkerConfig { min_size: mn, avg_size: av, max_size: mx }
+end
+
+;; ── Hashe i chunker ─────────────────────────────────────────────────────────
+
+;; Hash bajtów zakodowanych jako hex ("" przy niepoprawnym hexie).
+pub fn hash_hex(data_hex: string) -> string is
+    let n: int = data_hex.len()
+    if n == 0 is return hashing::hash_bytes([]) end
+    let raw: [int] = hashing::hex_decode(data_hex)
+    let rn: int = raw.len()
+    if rn == 0 is return "" end
+    return hashing::hash_bytes(raw)
+end
+
+pub fn hash_file(path: string) -> string is
+    if !fs::exists(path) is return "" end
+    let b: bytes = fs::read_bytes(path)
+    return hashing::hash_bytes(store::bytes_to_ints(b))
+end
+
+;; Granice chunków pliku (0 = domyślne): [{"offset":..,"size":..,"hash":".."}].
+pub fn chunk_file(path: string, min_size: int, avg_size: int, max_size: int) -> string is
+    if !fs::exists(path) is return fail("brak pliku: " + path) end
+    let b: bytes = fs::read_bytes(path)
+    let data: [int] = store::bytes_to_ints(b)
+    let rs: [chunker::Range] = chunker::chunk_ranges(data, cfg_of(min_size, avg_size, max_size))
+    let mut arr: [json::J] = []
+    let n: int = rs.len()
+    let mut i: int = 0
+    while i < n is
+        let r: chunker::Range = rs[i]
+        i += 1
+        let off: int = r.offset
+        let stop: int = r.offset + r.size
+        let part: [int] = data[off..stop]
+        let o: json::J = json::jobj()
+        json::set(o, "offset", json::jint(off))
+        json::set(o, "size", json::jint(r.size))
+        json::set(o, "hash", json::jstr(hashing::hash_bytes(part)))
+        arr.push(o)
+    end
+    let env: json::J = env_ok()
+    json::set(env, "chunks", json::jarr(arr))
+    return done(env)
+end
+
+;; ── Store ───────────────────────────────────────────────────────────────────
+
+pub fn store_put_file(root: string, path: string) -> string is
+    let o: store::OpenResult = store::open(root)
+    if !o.ok is return fail(o.error) end
+    if !fs::exists(path) is return fail("brak pliku: " + path) end
+    let b: bytes = fs::read_bytes(path)
+    let p: store::PutResult = store::put(o.store, store::bytes_to_ints(b))
+    if !p.ok is return fail(p.error) end
+    let env: json::J = env_ok()
+    json::set(env, "hash", json::jstr(p.hash))
+    return done(env)
+end
+
+pub fn store_put_hex(root: string, data_hex: string) -> string is
+    let o: store::OpenResult = store::open(root)
+    if !o.ok is return fail(o.error) end
+    let n: int = data_hex.len()
+    let mut raw: [int] = []
+    if n > 0 is
+        raw = hashing::hex_decode(data_hex)
+        let rn: int = raw.len()
+        if rn == 0 is return fail("niepoprawny hex") end
+    end
+    let p: store::PutResult = store::put(o.store, raw)
+    if !p.ok is return fail(p.error) end
+    let env: json::J = env_ok()
+    json::set(env, "hash", json::jstr(p.hash))
+    return done(env)
+end
+
+;; Zapisuje obiekt do pliku `dest`; {"ok":true,"found":bool}.
+pub fn store_get_file(root: string, hash: string, dest: string) -> string is
+    let o: store::OpenResult = store::open(root)
+    if !o.ok is return fail(o.error) end
+    if !hashing::is_valid_hash(hash) is return fail("niepoprawny hash: " + hash) end
+    let found: bool = store::has(o.store, hash)
+    let env: json::J = env_ok()
+    json::set(env, "found", json::jbool(found))
+    if found is
+        let r: sys::Exec = sys::exec("cp -- " + sys::sq(store::object_path(o.store, hash)) + " " + sys::sq(dest))
+        if r.code != 0 is return fail("kopiowanie obiektu nie powiodło się: " + r.out) end
+    end
+    return done(env)
+end
+
+;; Obiekt jako hex w polu "data" (dla małych obiektów).
+pub fn store_get_hex(root: string, hash: string) -> string is
+    let o: store::OpenResult = store::open(root)
+    if !o.ok is return fail(o.error) end
+    let g: store::GetResult = store::get(o.store, hash)
+    if !g.ok is return fail(g.error) end
+    let env: json::J = env_ok()
+    json::set(env, "found", json::jbool(g.found))
+    if g.found is json::set(env, "data", json::jstr(hashing::hex_of(g.data))) end
+    return done(env)
+end
+
+pub fn store_has(root: string, hash: string) -> bool is
+    let o: store::OpenResult = store::open(root)
+    if !o.ok is return false end
+    return store::has(o.store, hash)
+end
+
+;; `hashes_json` — tablica JSON napisów; zwraca {"ok":true,"missing":[...]}.
+pub fn store_missing(root: string, hashes_json: string) -> string is
+    let o: store::OpenResult = store::open(root)
+    if !o.ok is return fail(o.error) end
+    let p: json::Parsed = json::parse(hashes_json)
+    if !p.ok || p.value.kind != 4 is return fail("oczekiwano tablicy JSON z hashami") end
+    let mut hs: [string] = []
+    let n: int = p.value.items.len()
+    let mut i: int = 0
+    while i < n is
+        hs.push(json::as_str(p.value.items[i], ""))
+        i += 1
+    end
+    let miss: [string] = store::missing(o.store, hs)
+    let mut arr: [json::J] = []
+    for m in miss is
+        arr.push(json::jstr(m))
+    end
+    let env: json::J = env_ok()
+    json::set(env, "missing", json::jarr(arr))
+    return done(env)
+end
+
+pub fn store_list(root: string) -> string is
+    let o: store::OpenResult = store::open(root)
+    if !o.ok is return fail(o.error) end
+    let all: [string] = store::list_all(o.store)
+    let mut arr: [json::J] = []
+    for h in all is
+        arr.push(json::jstr(h))
+    end
+    let env: json::J = env_ok()
+    json::set(env, "hashes", json::jarr(arr))
+    return done(env)
+end
+
+pub fn store_delete(root: string, hash: string) -> bool is
+    let o: store::OpenResult = store::open(root)
+    if !o.ok is return false end
+    return store::delete_object(o.store, hash)
+end
+
+;; ── Manifest ────────────────────────────────────────────────────────────────
+
+;; Buduje manifest katalogu (chunki lądują w store pod `store_root`).
+;; {"ok":true,"manifest":{...}}; 0 w rozmiarach = domyślne.
+pub fn manifest_build(source_dir: string, store_root: string, min_size: int, avg_size: int, max_size: int) -> string is
+    let o: store::OpenResult = store::open(store_root)
+    if !o.ok is return fail(o.error) end
+    let b: manifest::BuildResult = manifest::build(source_dir, o.store, cfg_of(min_size, avg_size, max_size))
+    if !b.ok is return fail(b.error) end
+    let env: json::J = env_ok()
+    json::set(env, "manifest", manifest::to_json_value(b.manifest))
+    return done(env)
+end
+
+;; Sprawdza poprawność manifestu i przeliczenie `root`.
+pub fn manifest_verify(manifest_json: string) -> string is
+    let p: manifest::ParseResult = manifest::from_json(manifest_json)
+    if !p.ok is return fail(p.error) end
+    let recomputed: string = manifest::compute_root(p.manifest.entries)
+    let env: json::J = env_ok()
+    json::set(env, "valid", json::jbool(recomputed == p.manifest.root))
+    json::set(env, "root", json::jstr(p.manifest.root))
+    json::set(env, "recomputedRoot", json::jstr(recomputed))
+    json::set(env, "warning", json::jstr(p.warning))
+    return done(env)
+end
+
+pub fn manifest_diff(old_json: string, new_json: string) -> string is
+    let a: manifest::ParseResult = manifest::from_json(old_json)
+    if !a.ok is return fail("stary manifest: " + a.error) end
+    let b: manifest::ParseResult = manifest::from_json(new_json)
+    if !b.ok is return fail("nowy manifest: " + b.error) end
+    let d: [manifest::DiffEntry] = manifest::diff(a.manifest, b.manifest)
+    let mut arr: [json::J] = []
+    let n: int = d.len()
+    let mut i: int = 0
+    while i < n is
+        let e: manifest::DiffEntry = d[i]
+        i += 1
+        let o: json::J = json::jobj()
+        json::set(o, "kind", json::jstr(e.kind))
+        json::set(o, "path", json::jstr(e.path))
+        json::set(o, "oldChunks", json::jint(e.old_chunks))
+        json::set(o, "newChunks", json::jint(e.new_chunks))
+        json::set(o, "reusedChunks", json::jint(e.reused_chunks))
+        arr.push(o)
+    end
+    let env: json::J = env_ok()
+    json::set(env, "entries", json::jarr(arr))
+    return done(env)
+end
+
+;; Odtwarza drzewo plików manifestu z chunków store'a do `dest_dir`.
+pub fn manifest_materialize(manifest_json: string, store_root: string, dest_dir: string) -> string is
+    let o: store::OpenResult = store::open(store_root)
+    if !o.ok is return fail(o.error) end
+    let p: manifest::ParseResult = manifest::from_json(manifest_json)
+    if !p.ok is return fail(p.error) end
+    let r: composefs::CfsResult = composefs::materialize_tree(p.manifest, o.store, dest_dir)
+    if !r.ok is return fail(r.error) end
+    return done(env_ok())
+end
+
+;; ── Warstwy, OCI, GC ────────────────────────────────────────────────────────
+
+;; `layers_json` — tablica JSON ścieżek do tarów warstw (dół -> góra).
+pub fn layers_materialize(layers_json: string, work_dir: string, dest_dir: string) -> string is
+    let p: json::Parsed = json::parse(layers_json)
+    if !p.ok || p.value.kind != 4 is return fail("oczekiwano tablicy JSON ze ścieżkami warstw") end
+    let mut paths: [string] = []
+    let n: int = p.value.items.len()
+    let mut i: int = 0
+    while i < n is
+        paths.push(json::as_str(p.value.items[i], ""))
+        i += 1
+    end
+    let r: layers::LayerResult = layers::materialize_layers(paths, work_dir, dest_dir)
+    if !r.ok is return fail(r.error) end
+    return done(env_ok())
+end
+
+pub fn oci_parse_ref(image_ref: string) -> string is
+    let r: oci::RefResult = oci::parse_image_ref(image_ref)
+    if !r.ok is return fail(r.error) end
+    let env: json::J = env_ok()
+    json::set(env, "registry", json::jstr(r.ref.registry))
+    json::set(env, "repository", json::jstr(r.ref.repository))
+    json::set(env, "reference", json::jstr(r.ref.reference))
+    return done(env)
+end
+
+pub fn oci_resolve_layers(image_ref: string, cache_dir: string) -> string is
+    let r: oci::RefResult = oci::parse_image_ref(image_ref)
+    if !r.ok is return fail(r.error) end
+    let res: oci::ResolveResult = oci::resolve_image_layers(r.ref, cache_dir)
+    if !res.ok is return fail(res.error) end
+    let mut arr: [json::J] = []
+    let n: int = res.layers.len()
+    let mut i: int = 0
+    while i < n is
+        let l: oci::ResolvedLayer = res.layers[i]
+        i += 1
+        let o: json::J = json::jobj()
+        json::set(o, "digest", json::jstr(l.layer.digest))
+        json::set(o, "mediaType", json::jstr(l.layer.media_type))
+        json::set(o, "size", json::jint(l.layer.size))
+        json::set(o, "path", json::jstr(l.path))
+        json::set(o, "cached", json::jbool(l.was_cached))
+        arr.push(o)
+    end
+    let env: json::J = env_ok()
+    json::set(env, "layers", json::jarr(arr))
+    return done(env)
+end
+
+pub fn gc_run(root: string, dry_run: bool) -> string is
+    let r: gc::GcResult = gc::run_gc(root, dry_run)
+    if !r.ok is return fail(r.error) end
+    let env: json::J = env_ok()
+    json::set(env, "scannedObjects", json::jint(r.scanned_objects))
+    json::set(env, "liveObjects", json::jint(r.live_objects))
+    json::set(env, "deletedObjects", json::jint(r.deleted_objects))
+    json::set(env, "freedBytes", json::jint(r.freed_bytes))
+    return done(env)
+end
+
+;; ── composefs / dm-verity ───────────────────────────────────────────────────
+
+pub fn composefs_build(manifest_json: string, store_root: string, materialized_dir: string, output_image: string) -> string is
+    let o: store::OpenResult = store::open(store_root)
+    if !o.ok is return fail(o.error) end
+    let p: manifest::ParseResult = manifest::from_json(manifest_json)
+    if !p.ok is return fail(p.error) end
+    let r: composefs::CfsResult = composefs::build_image(p.manifest, o.store, materialized_dir, output_image)
+    if !r.ok is return fail(r.error) end
+    let env: json::J = env_ok()
+    json::set(env, "digest", json::jstr(r.value))
+    return done(env)
+end
+
+pub fn composefs_mount(image: string, mountpoint: string, basedir: string) -> string is
+    let r: composefs::CfsResult = composefs::mount_image(image, mountpoint, basedir)
+    if !r.ok is return fail(r.error) end
+    return done(env_ok())
+end
+
+pub fn composefs_mount_verified(image: string, mountpoint: string, expected_digest: string, basedir: string) -> string is
+    let r: composefs::CfsResult = composefs::mount_verified(image, mountpoint, expected_digest, basedir)
+    if !r.ok is return fail(r.error) end
+    return done(env_ok())
+end
+
+pub fn fs_verity_kernel_support() -> bool is return composefs::fs_verity_kernel_support() end
+pub fn device_mapper_available() -> bool is return composefs::device_mapper_available() end
+
+pub fn dmverity_format(data_path: string) -> string is
+    let r: composefs::DmVerityInfo = composefs::dm_verity_format(data_path)
+    if !r.ok is return fail(r.error) end
+    let env: json::J = env_ok()
+    json::set(env, "rootHash", json::jstr(r.root_hash))
+    json::set(env, "hashTreePath", json::jstr(r.hash_tree_path))
+    return done(env)
+end
+
+pub fn dmverity_verify(data_path: string, hash_tree_path: string, root_hash: string) -> bool is
+    return composefs::dm_verity_verify(data_path, hash_tree_path, root_hash)
+end
+
+pub fn dmverity_open(data_path: string, hash_tree_path: string, root_hash: string, mapper_name: string) -> string is
+    let r: composefs::CfsResult = composefs::dm_verity_open(data_path, hash_tree_path, root_hash, mapper_name)
+    if !r.ok is return fail(r.error) end
+    let env: json::J = env_ok()
+    json::set(env, "device", json::jstr(r.value))
+    return done(env)
+end
+
+pub fn dmverity_close(mapper_name: string) is
+    composefs::dm_verity_close(mapper_name)
+end
+
+;; ── OverlayFS ───────────────────────────────────────────────────────────────
+
+pub fn overlay_create(lowerdir: string, ft_root: string, name: string, mountpoint: string, ephemeral: bool, size_mb: int) -> string is
+    let mut r: overlay::OverlayResult = overlay::new_persistent_overlay(lowerdir, ft_root, name, mountpoint)
+    if ephemeral is
+        let mut mb: int = size_mb
+        if mb <= 0 is mb = 512 end
+        r = overlay::new_tmp_overlay(lowerdir, mountpoint, mb)
+    end
+    if !r.ok is return fail(r.error) end
+    let env: json::J = env_ok()
+    json::set(env, "mountpoint", json::jstr(r.overlay.mountpoint))
+    json::set(env, "upperdir", json::jstr(r.overlay.upperdir))
+    json::set(env, "workdir", json::jstr(r.overlay.workdir))
+    json::set(env, "ephemeral", json::jbool(r.overlay.ephemeral))
+    return done(env)
+end
+
+pub fn overlay_unmount(mountpoint: string, ephemeral: bool) -> string is
+    let mut tmpfs: string = ""
+    if ephemeral is tmpfs = mountpoint + ".tmpfs" end
+    let ov: overlay::Overlay = overlay::Overlay { lowerdir: "", upperdir: "", workdir: "",
+        mountpoint: mountpoint, ephemeral: ephemeral, tmpfs_mount: tmpfs }
+    let e: string = overlay::unmount_overlay(ov)
+    if e != "" is return fail(e) end
+    return done(env_ok())
+end
+
+pub fn overlay_list(ft_root: string) -> string is
+    let ovs: [overlay::OverlayInfo] = overlay::list_active_overlays(ft_root)
+    let mut arr: [json::J] = []
+    let n: int = ovs.len()
+    let mut i: int = 0
+    while i < n is
+        let v: overlay::OverlayInfo = ovs[i]
+        i += 1
+        let o: json::J = json::jobj()
+        json::set(o, "name", json::jstr(v.name))
+        json::set(o, "mountpoint", json::jstr(v.mountpoint))
+        json::set(o, "upperdir", json::jstr(v.upperdir))
+        json::set(o, "ephemeral", json::jbool(v.ephemeral))
+        json::set(o, "mounted", json::jbool(v.mounted))
+        arr.push(o)
+    end
+    let env: json::J = env_ok()
+    json::set(env, "overlays", json::jarr(arr))
+    return done(env)
+end
+
+pub fn overlay_changes(upperdir: string) -> string is
+    let ov: overlay::Overlay = overlay::Overlay { lowerdir: "", upperdir: upperdir, workdir: "",
+        mountpoint: "", ephemeral: false, tmpfs_mount: "" }
+    let ch: [string] = overlay::list_changes(ov)
+    let mut arr: [json::J] = []
+    for c in ch is
+        arr.push(json::jstr(c))
+    end
+    let env: json::J = env_ok()
+    json::set(env, "changes", json::jarr(arr))
+    return done(env)
+end
+
+;; ── CLI ─────────────────────────────────────────────────────────────────────
+
+;; Uruchamia komendę CLI; `args_json` = tablica JSON napisów (bez nazwy
+;; programu). Zwraca kod wyjścia (0 = sukces); komunikaty idą na stdout/stderr.
+pub fn cli_run(args_json: string) -> int is
+    let p: json::Parsed = json::parse(args_json)
+    if !p.ok || p.value.kind != 4 is return 2 end
+    let mut args: [string] = []
+    let n: int = p.value.items.len()
+    let mut i: int = 0
+    while i < n is
+        args.push(json::as_str(p.value.items[i], ""))
+        i += 1
+    end
+    return cli::run(args)
+end

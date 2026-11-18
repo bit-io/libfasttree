@@ -1,0 +1,82 @@
+use "std -> test" from "test"
+use "std -> env" from "env"
+mod check
+use "std -> fs" from "fs"
+mod text
+mod hashing
+mod sys
+mod store
+
+fn fresh(name: string) -> string is
+    let root: string = text::path_join(sys::tmp_dir(), "fasttree-h-test-" + name + "-" + text::istr(sys::pid()))
+    sys::rm_rf(root)
+    return root
+end
+
+#[test]
+fn put_get_roundtrip_with_nul_bytes() is
+    let root: string = fresh("put")
+    let o: store::OpenResult = store::open(root)
+    test::assert_true(o.ok)
+    let data: [int] = [0, 1, 2, 0, 255, 0]
+    let p: store::PutResult = store::put(o.store, data)
+    test::assert_true(p.ok)
+    check::eq(p.hash, hashing::hash_bytes(data))
+    let g: store::GetResult = store::get(o.store, p.hash)
+    test::assert_true(g.found)
+    check::eq(hashing::hex_of(g.data), "00010200ff00")
+    sys::rm_rf(root)
+end
+
+#[test]
+fn dedup_is_idempotent() is
+    let root: string = fresh("dedup")
+    let o: store::OpenResult = store::open(root)
+    let a: store::PutResult = store::put(o.store, [1, 2, 3])
+    let b: store::PutResult = store::put(o.store, [1, 2, 3])
+    check::eq(a.hash, b.hash)
+    let all: [string] = store::list_all(o.store)
+    check::eq(text::istr(all.len()), "1")
+    sys::rm_rf(root)
+end
+
+#[test]
+fn missing_has_and_delete() is
+    let root: string = fresh("miss")
+    let o: store::OpenResult = store::open(root)
+    let p: store::PutResult = store::put(o.store, [7, 7])
+    let nope: string = "0000000000000000000000000000000000000000000000000000000000000000"
+    let m: [string] = store::missing(o.store, [p.hash, nope])
+    check::eq(text::istr(m.len()), "1")
+    check::eq(m[0], nope)
+    test::assert_true(store::has(o.store, p.hash))
+    test::assert_true(store::delete_object(o.store, p.hash))
+    test::assert_false(store::has(o.store, p.hash))
+    test::assert_false(store::delete_object(o.store, p.hash))
+    sys::rm_rf(root)
+end
+
+#[test]
+fn invalid_hash_is_rejected() is
+    let root: string = fresh("inv")
+    let o: store::OpenResult = store::open(root)
+    let g: store::GetResult = store::get(o.store, "../../etc/passwd")
+    test::assert_false(g.ok)
+    test::assert_false(store::has(o.store, "xyz"))
+    sys::rm_rf(root)
+end
+
+#[test]
+fn newer_format_is_refused() is
+    let root: string = fresh("fmt")
+    let o: store::OpenResult = store::open(root)
+    test::assert_true(o.ok)
+    let w: bool = fs::write(text::path_join(root, "FORMAT"), "99")
+    let o2: store::OpenResult = store::open(root)
+    test::assert_false(o2.ok)
+    test::assert_true(text::contains(o2.error, "FORMAT=99"))
+    sys::rm_rf(root)
+end
+
+fn main() is
+end

@@ -1,0 +1,83 @@
+use "std -> test" from "test"
+use "std -> env" from "env"
+mod check
+use "std -> fs" from "fs"
+mod text
+mod hashing
+mod chunker
+mod sys
+mod json
+mod store
+mod manifest
+mod gc
+
+fn setup(name: string) -> string is
+    let root: string = text::path_join(sys::tmp_dir(), "fasttree-h-gc-" + name + "-" + text::istr(sys::pid()))
+    sys::rm_rf(root)
+    fs::mkdir(text::path_join(root, "manifests"))
+    return root
+end
+
+fn live_tree(root: string, tag: string, content: string) -> string is
+    let o: store::OpenResult = store::open(text::path_join(root, "store"))
+    let src: string = root + "-src-" + tag
+    sys::rm_rf(src)
+    fs::mkdir(src)
+    let w: bool = fs::write(text::path_join(src, "f"), content)
+    let b: manifest::BuildResult = manifest::build_default(src, o.store)
+    let w2: bool = fs::write(manifest::manifest_path_in(root, tag), manifest::to_json(b.manifest))
+    sys::rm_rf(src)
+    return tag
+end
+
+#[test]
+fn deletes_only_unreferenced_objects() is
+    let root: string = setup("del")
+    let t: string = live_tree(root, "v1", "zywe")
+    let w: bool = fs::write(text::path_join(root, "CURRENT_TAG"), "v1")
+    let o: store::OpenResult = store::open(text::path_join(root, "store"))
+    let orphan: store::PutResult = store::put(o.store, [9, 9, 9])
+    let dry: gc::GcResult = gc::run_gc(root, true)
+    test::assert_true(dry.ok)
+    check::eq(text::istr(dry.deleted_objects), "1")
+    test::assert_true(store::has(o.store, orphan.hash))
+    let real: gc::GcResult = gc::run_gc(root, false)
+    check::eq(text::istr(real.deleted_objects), "1")
+    check::eq(text::istr(real.freed_bytes), "3")
+    check::eq(text::istr(real.live_objects), "1")
+    test::assert_false(store::has(o.store, orphan.hash))
+    sys::rm_rf(root)
+end
+
+#[test]
+fn pinned_tags_stay_alive() is
+    let root: string = setup("pin")
+    let t1: string = live_tree(root, "v1", "stare")
+    let t2: string = live_tree(root, "v2", "nowe")
+    let w: bool = fs::write(text::path_join(root, "CURRENT_TAG"), "v2")
+    let before: gc::GcResult = gc::run_gc(root, true)
+    check::eq(text::istr(before.deleted_objects), "1")
+    let w2: bool = fs::write(text::path_join(root, "pins.json"), "[{\"tag\": \"v1\", \"note\": \"n\"}]")
+    let after: gc::GcResult = gc::run_gc(root, true)
+    check::eq(text::istr(after.deleted_objects), "0")
+    check::eq(text::istr(after.live_objects), "2")
+    sys::rm_rf(root)
+end
+
+#[test]
+fn missing_manifest_for_live_tag_aborts_gc() is
+    let root: string = setup("miss")
+    let t: string = live_tree(root, "v1", "x")
+    let w: bool = fs::write(text::path_join(root, "CURRENT_TAG"), "v1")
+    sys::rm_f(manifest::manifest_path_in(root, "v1"))
+    let r: gc::GcResult = gc::run_gc(root, false)
+    test::assert_false(r.ok)
+    test::assert_true(text::contains(r.error, "brak manifestu"))
+    let o: store::OpenResult = store::open(text::path_join(root, "store"))
+    let all: [string] = store::list_all(o.store)
+    check::eq(text::istr(all.len()), "1")
+    sys::rm_rf(root)
+end
+
+fn main() is
+end

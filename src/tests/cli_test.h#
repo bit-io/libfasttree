@@ -1,0 +1,25 @@
+use "std -> test" from "test"
+use "std -> env" from "env"
+use "std -> fs" from "fs"
+mod check
+mod text
+mod sys
+mod cli
+
+#[test]
+fn sanitize_tag_replaces_colons() is
+    check::eq(cli::sanitize_tag("sha256:abc"), "sha256_abc")
+    check::eq(cli::sanitize_tag("v2.0"), "v2.0")
+end
+
+#[test]
+fn run_rejects_unknown_and_incomplete_commands() is
+    check::eq(text::istr(cli::run([])), "1")
+    check::eq(text::istr(cli::run(["nieznana"])), "1")
+    check::eq(text::istr(cli::run(["pull"])), "1")
+    check::eq(text::istr(cli::run(["pin", "tag"])), "1")
+    check::eq(text::istr(cli::run(["overlay"])), "1")
+end
+
+fn main() is
+end

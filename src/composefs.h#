@@ -7,7 +7,7 @@ mod ioengine
 use "std -> fs" from "fs"
 use "std -> collections" from "col"
 
-;; Montowalne, weryfikowalne obrazy composefs + dm-verity — port composefs.nim.
+;; Montowalne, weryfikowalne obrazy composefs + dm-verity.
 ;; Narzędzia zewnętrzne: mkcomposefs, mount.composefs, composefs-info,
 ;; veritysetup, losetup.
 

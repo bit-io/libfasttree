@@ -1,0 +1,213 @@
+use "std -> test" from "test"
+use "std -> env" from "env"
+mod check
+use "std -> fs" from "fs"
+mod text
+mod sys
+mod store
+mod manifest
+mod composefs
+mod repo
+mod derive
+
+fn setup(name: string) -> string is
+    let root: string = text::path_join(sys::tmp_dir(), "fasttree-h-derive-" + name + "-" + text::istr(sys::pid()))
+    sys::rm_rf(root)
+    fs::mkdir(text::path_join(root, "manifests"))
+    return root
+end
+
+fn put(path: string, content: string) is
+    fs::mkdir(text::dirname(path))
+    let w: bool = fs::write(path, content)
+end
+
+fn snapshot(root: string, src: string, tag: string) is
+    let o: store::OpenResult = store::open(text::path_join(root, "store"))
+    let b: manifest::BuildResult = manifest::build_default(src, o.store)
+    let w: bool = fs::write(manifest::manifest_path_in(root, tag), manifest::to_json(b.manifest))
+end
+
+fn restore(root: string, tag: string, dest: string) is
+    let o: store::OpenResult = store::open(text::path_join(root, "store"))
+    let p: manifest::ParseResult = manifest::load(manifest::manifest_path_in(root, tag))
+    test::assert_true(p.ok)
+    let r: composefs::CfsResult = composefs::materialize_tree(p.manifest, o.store, dest)
+    test::assert_true(r.ok)
+end
+
+fn count_objects(root: string) -> int is
+    let o: store::OpenResult = store::open(text::path_join(root, "store"))
+    return store::list_all(o.store).len()
+end
+
+#[test]
+fn applies_additions_modifications_and_deletions() is
+    let root: string = setup("mix")
+    let victim: string = root + "-victim"
+    sys::rm_rf(victim)
+    put(victim + "/precious", "nie ruszac")
+    let base: string = root + "-base"
+    put(base + "/a.txt", "A")
+    put(base + "/keep.txt", "K")
+    put(base + "/gone.txt", "G")
+    put(base + "/d/x", "x")
+    put(base + "/d/y", "y")
+    put(base + "/untouched", "U")
+    test::assert_true(sys::symlink(victim, base + "/lnk"))
+    snapshot(root, base, "base")
+    let base_root: string = manifest::load(manifest::manifest_path_in(root, "base")).manifest.root
+
+    let ch: string = root + "-changes"
+    put(ch + "/a.txt", "A2 zmienione")
+    put(ch + "/new/n.txt", "N")
+    put(ch + "/.wh.keep.txt", "")
+    put(ch + "/d/.wh..wh..opq", "")
+    put(ch + "/d/z", "Z")
+    put(ch + "/lnk/inner", "I")
+    let mk: sys::Exec = sys::exec("mknod " + sys::sq(ch + "/gone.txt") + " c 0 0")
+    let have_chardev: bool = mk.code == 0
+
+    let r: derive::DeriveResult = derive::derive(root, "base", ch, "derived")
+    if !r.ok is sys::eprint(r.error) end
+    test::assert_true(r.ok)
+
+    let out: string = root + "-out"
+    restore(root, "derived", out)
+    check::eq(fs::read(out + "/a.txt"), "A2 zmienione")
+    check::eq(fs::read(out + "/untouched"), "U")
+    check::eq(fs::read(out + "/new/n.txt"), "N")
+    check::eq(fs::read(out + "/d/z"), "Z")
+    test::assert_false(fs::exists(out + "/keep.txt"))
+    test::assert_false(fs::exists(out + "/d/x"))
+    test::assert_false(fs::exists(out + "/d/y"))
+    if have_chardev is
+        test::assert_false(fs::exists(out + "/gone.txt"))
+    else is
+        check::eq(fs::read(out + "/gone.txt"), "G")
+    end
+    ;; symlink zastąpiony katalogiem, a cel symlinku nietknięty
+    test::assert_false(sys::is_symlink(out + "/lnk"))
+    check::eq(fs::read(out + "/lnk/inner"), "I")
+    test::assert_false(fs::exists(victim + "/inner"))
+    check::eq(fs::read(victim + "/precious"), "nie ruszac")
+
+    ;; baza bez zmian
+    check::eq(manifest::load(manifest::manifest_path_in(root, "base")).manifest.root, base_root)
+    let nroot: string = manifest::load(manifest::manifest_path_in(root, "derived")).manifest.root
+    check::ne(nroot, base_root)
+    check::eq(r.root, nroot)
+
+    sys::rm_rf(root)
+    sys::rm_rf(victim)
+    sys::rm_rf(base)
+    sys::rm_rf(ch)
+    sys::rm_rf(out)
+end
+
+#[test]
+fn whiteout_does_not_follow_base_symlinks() is
+    let root: string = setup("symwh")
+    let victim: string = root + "-victim"
+    sys::rm_rf(victim)
+    put(victim + "/target.txt", "cel")
+    let base: string = root + "-base"
+    put(base + "/f", "f")
+    test::assert_true(sys::symlink(victim, base + "/lnk"))
+    snapshot(root, base, "base")
+    ;; whiteout dla lnk/target.txt: lnk w zmianach jest katalogiem, więc
+    ;; zastępuje symlink i usunięcie nie może dotknąć celu symlinku.
+    let ch: string = root + "-changes"
+    put(ch + "/lnk/.wh.target.txt", "")
+    let r: derive::DeriveResult = derive::derive(root, "base", ch, "d2")
+    test::assert_true(r.ok)
+    check::eq(fs::read(victim + "/target.txt"), "cel")
+    sys::rm_rf(root)
+    sys::rm_rf(victim)
+    sys::rm_rf(base)
+    sys::rm_rf(ch)
+end
+
+#[test]
+fn empty_changes_reuse_everything() is
+    let root: string = setup("empty")
+    let base: string = root + "-base"
+    put(base + "/a", "aaa")
+    put(base + "/b/c", "ccc")
+    snapshot(root, base, "base")
+    let before: int = count_objects(root)
+    let ch: string = root + "-changes"
+    fs::mkdir(ch)
+    let r: derive::DeriveResult = derive::derive(root, "base", ch, "same")
+    test::assert_true(r.ok)
+    check::eq(text::istr(count_objects(root)), text::istr(before))
+    check::eq(r.root, manifest::load(manifest::manifest_path_in(root, "base")).manifest.root)
+    check::eq(text::istr(r.changed), "0")
+    sys::rm_rf(root)
+    sys::rm_rf(base)
+    sys::rm_rf(ch)
+end
+
+#[test]
+fn only_new_content_adds_chunks() is
+    let root: string = setup("dedup")
+    let base: string = root + "-base"
+    put(base + "/a", "aaa")
+    put(base + "/b", "bbb")
+    snapshot(root, base, "base")
+    let before: int = count_objects(root)
+    let ch: string = root + "-changes"
+    put(ch + "/nowy", "zupelnie nowa tresc")
+    put(ch + "/kopia_a", "aaa")
+    let r: derive::DeriveResult = derive::derive(root, "base", ch, "plus")
+    test::assert_true(r.ok)
+    check::eq(text::istr(count_objects(root)), text::istr(before + 1))
+    check::eq(text::istr(r.changed), "2")
+    check::eq(text::istr(r.entries), "4")
+    sys::rm_rf(root)
+    sys::rm_rf(base)
+    sys::rm_rf(ch)
+end
+
+#[test]
+fn rejects_bad_input() is
+    let root: string = setup("bad")
+    let base: string = root + "-base"
+    put(base + "/a", "a")
+    snapshot(root, base, "base")
+    let ch: string = root + "-changes"
+    fs::mkdir(ch)
+    test::assert_false(derive::derive(root, "base", ch, "base").ok)
+    test::assert_false(derive::derive(root, "base", ch, "../zly").ok)
+    test::assert_false(derive::derive(root, "../zly", ch, "x").ok)
+    test::assert_false(derive::derive(root, "nie-ma", ch, "x").ok)
+    test::assert_false(derive::derive(root, "base", root + "-brak", "x").ok)
+    test::assert_true(derive::derive(root, "base", ch, "ok1").ok)
+    let dup: derive::DeriveResult = derive::derive(root, "base", ch, "ok1")
+    test::assert_false(dup.ok)
+    test::assert_true(text::contains(dup.error, "już istnieje"))
+    sys::rm_rf(root)
+    sys::rm_rf(base)
+    sys::rm_rf(ch)
+end
+
+#[test]
+fn derived_tag_passes_fsck_style_checks() is
+    let root: string = setup("verify")
+    let base: string = root + "-base"
+    put(base + "/a", "a")
+    snapshot(root, base, "base")
+    let ch: string = root + "-changes"
+    put(ch + "/b", "b")
+    test::assert_true(derive::derive(root, "base", ch, "v2").ok)
+    let o: store::OpenResult = store::open(text::path_join(root, "store"))
+    let p: manifest::ParseResult = manifest::load(manifest::manifest_path_in(root, "v2"))
+    test::assert_true(p.ok)
+    check::eq(manifest::compute_root(p.manifest.entries), p.manifest.root)
+    sys::rm_rf(root)
+    sys::rm_rf(base)
+    sys::rm_rf(ch)
+end
+
+fn main() is
+end

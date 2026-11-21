@@ -21,5 +21,117 @@ fn run_rejects_unknown_and_incomplete_commands() is
     check::eq(text::istr(cli::run(["overlay"])), "1")
 end
 
+#[test]
+fn new_commands_validate_arguments() is
+    check::eq(text::istr(cli::run(["snapshot"])), "1")
+    check::eq(text::istr(cli::run(["snapshot", "katalog"])), "1")
+    check::eq(text::istr(cli::run(["unpin"])), "1")
+    check::eq(text::istr(cli::run(["rm"])), "1")
+    check::eq(text::istr(cli::run(["verify"])), "1")
+    check::eq(text::istr(cli::run(["diff", "a"])), "1")
+    check::eq(text::istr(cli::run(["checkout", "tag"])), "1")
+    check::eq(text::istr(cli::run(["derive", "a", "b"])), "1")
+    check::eq(text::istr(cli::run(["overlay", "commit", "x"])), "1")
+end
+
+#[test]
+fn version_command() is
+    check::eq(cli::version(), "0.4.0")
+    check::eq(text::istr(cli::run(["version"])), "0")
+    check::eq(text::istr(cli::run(["--version"])), "0")
+end
+
+fn write_file(path: string, content: string) is
+    fs::mkdir(text::dirname(path))
+    let w: bool = fs::write(path, content)
+end
+
+;; Cały przepływ lokalny przez cli::run na izolowanym FASTTREE_ROOT:
+;; snapshot -> list/verify/stats/diff -> checkout -> fsck -> rm.
+#[test]
+fn local_workflow_end_to_end() is
+    let base: string = text::path_join(sys::tmp_dir(), "fasttree-h-cli-e2e-" + text::istr(sys::pid()))
+    sys::rm_rf(base)
+    env::set("FASTTREE_ROOT", base + "/root")
+    let src: string = base + "/src"
+    write_file(src + "/etc/app.conf", "v1")
+    write_file(src + "/data.txt", "dane")
+    check::eq(text::istr(cli::run(["snapshot", src, "v1"])), "0")
+    write_file(src + "/etc/app.conf", "v2 zmienione")
+    write_file(src + "/nowy.txt", "n")
+    check::eq(text::istr(cli::run(["snapshot", src, "v2"])), "0")
+    test::assert_true(fs::exists(base + "/root/manifests/v1.json"))
+    test::assert_true(fs::exists(base + "/root/manifests/v2.json"))
+    check::eq(text::istr(cli::run(["list"])), "0")
+    check::eq(text::istr(cli::run(["verify", "v1"])), "0")
+    check::eq(text::istr(cli::run(["stats", "v2"])), "0")
+    check::eq(text::istr(cli::run(["stats"])), "0")
+    check::eq(text::istr(cli::run(["diff", "v1", "v2"])), "0")
+    check::eq(text::istr(cli::run(["diff", "v1", "brak"])), "1")
+    check::eq(text::istr(cli::run(["fsck"])), "0")
+
+    let out: string = base + "/out"
+    check::eq(text::istr(cli::run(["checkout", "v1", out])), "0")
+    check::eq(fs::read(out + "/etc/app.conf"), "v1")
+    check::eq(fs::read(out + "/data.txt"), "dane")
+    test::assert_false(fs::exists(out + "/nowy.txt"))
+    ;; checkout nie nadpisuje istniejącego katalogu
+    check::eq(text::istr(cli::run(["checkout", "v1", out])), "1")
+
+    ;; usunięcie: aktywny tag odmowa, nieaktywny OK
+    let w: bool = fs::write(base + "/root/CURRENT_TAG", "v2")
+    check::eq(text::istr(cli::run(["rm", "v2"])), "1")
+    check::eq(text::istr(cli::run(["rm", "v1"])), "0")
+    test::assert_false(fs::exists(base + "/root/manifests/v1.json"))
+    check::eq(text::istr(cli::run(["verify", "v1"])), "1")
+
+    ;; pin / unpin
+    check::eq(text::istr(cli::run(["pin", "v2", "wazny"])), "0")
+    check::eq(text::istr(cli::run(["pins"])), "0")
+    check::eq(text::istr(cli::run(["unpin", "v2"])), "0")
+    sys::rm_rf(base)
+end
+
+#[test]
+fn derive_via_cli() is
+    let base: string = text::path_join(sys::tmp_dir(), "fasttree-h-cli-derive-" + text::istr(sys::pid()))
+    sys::rm_rf(base)
+    env::set("FASTTREE_ROOT", base + "/root")
+    write_file(base + "/src/etc/os", "v1")
+    write_file(base + "/src/usr/bin/tool", "tool")
+    check::eq(text::istr(cli::run(["snapshot", base + "/src", "v1"])), "0")
+    write_file(base + "/chg/etc/os", "v2")
+    write_file(base + "/chg/usr/bin/.wh.tool", "")
+    write_file(base + "/chg/usr/bin/nowy", "nowy")
+    check::eq(text::istr(cli::run(["derive", "v1", base + "/chg", "v2"])), "0")
+    check::eq(text::istr(cli::run(["derive", "v1", base + "/chg", "v2"])), "1")
+    check::eq(text::istr(cli::run(["derive", "brak", base + "/chg", "v3"])), "1")
+    check::eq(text::istr(cli::run(["verify", "v2"])), "0")
+    check::eq(text::istr(cli::run(["checkout", "v2", base + "/out"])), "0")
+    check::eq(fs::read(base + "/out/etc/os"), "v2")
+    check::eq(fs::read(base + "/out/usr/bin/nowy"), "nowy")
+    test::assert_false(fs::exists(base + "/out/usr/bin/tool"))
+    check::eq(text::istr(cli::run(["diff", "v1", "v2"])), "0")
+    sys::rm_rf(base)
+end
+
+#[test]
+fn fsck_exit_code_reflects_damage() is
+    let base: string = text::path_join(sys::tmp_dir(), "fasttree-h-cli-fsck-" + text::istr(sys::pid()))
+    sys::rm_rf(base)
+    env::set("FASTTREE_ROOT", base + "/root")
+    write_file(base + "/src/f", "zawartosc")
+    check::eq(text::istr(cli::run(["snapshot", base + "/src", "t"])), "0")
+    check::eq(text::istr(cli::run(["fsck"])), "0")
+    let found: sys::Exec = sys::exec("find " + sys::sq(base + "/root/store/objects") + " -type f | head -1")
+    let obj: string = text::trim(found.out)
+    test::assert_true(obj != "")
+    let w: bool = fs::write(obj, "ZEPSUTE!!")
+    check::eq(text::istr(cli::run(["fsck"])), "1")
+    check::eq(text::istr(cli::run(["fsck", "--repair"])), "1")
+    check::eq(text::istr(cli::run(["verify", "t"])), "1")
+    sys::rm_rf(base)
+end
+
 fn main() is
 end

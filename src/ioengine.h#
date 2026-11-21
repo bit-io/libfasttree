@@ -3,11 +3,11 @@ mod sys
 mod store
 use "std -> fs" from "fs"
 
-;; Silnik wsadowego I/O — port ioengine.nim.
+;; Silnik wsadowego I/O.
 ;;
-;; Wersja Nim miała dwa backendy (asyncdispatch / io_uring). H# 0.9 nie ma
-;; async I/O ani wiązań do liburing, więc tu jest jeden, sekwencyjny backend
-;; z IDENTYCZNYM API (IoJob, read_batch, write_batch). Dla najcięższej
+;; H# 0.9 nie ma async I/O ani wiązań do liburing, więc jest jeden,
+;; sekwencyjny backend z API gotowym pod szybszy backend (IoJob, read_batch,
+;; write_batch). Dla najcięższej
 ;; operacji — składania plików z chunków przy materializacji — jest szybka
 ;; ścieżka `concat_files`, która deleguje do `cat` (kopiowanie jądro->jądro
 ;; bez trzymania danych w pamięci procesu).

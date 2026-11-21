@@ -4,7 +4,7 @@ mod sys
 mod json
 use "std -> fs" from "fs"
 
-;; Klient rejestru OCI (Docker Registry HTTP API v2) — port oci.nim.
+;; Klient rejestru OCI (Docker Registry HTTP API v2).
 ;;
 ;; Transport: systemowy `curl`. Wbudowany klient HTTP H# 0.9 nie ma TLS,
 ;; nagłówków ani ciał binarnych, więc nie nadaje się do rejestrów (ghcr.io,

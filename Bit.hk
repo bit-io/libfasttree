@@ -1,14 +1,27 @@
 [package]
 -> name        => libfasttree
--> version     => 0.2.0
--> description => FastTree — content-addressable, block-oriented następca OSTree (Nim, docelowo też Rust i H#)
--> author      => Zenit Linux Developers <zenitlinux8@gmail.com>
+-> version     => 0.4.0
+-> description => FastTree — content-addressable, block-oriented następca OSTree (H#, stabilne C ABI ft_*)
+-> authors     => ["Bit Developers"]
 -> license     => MIT
+-> lang        => h#
 
-[build]
--> lang   => h#
--> entry  => src/bit-io/main.h#
--> output => build/libfasttree
+[edition]
+-> edition => 2026
 
-[deps]
--> fasttree => static
+[layout]
+-> src => src
+
+[lib]
+-> output => hlib
+
+[commands]
+-> build-lib
+--> run => scripts/build-lib.sh --release
+--> description => Zbuduj CLI (build/fasttree) oraz libfasttree.so / .a
+-> test-all
+--> run => scripts/run-tests.sh
+--> description => Uruchom wszystkie testy jednostkowe H# (src/tests)
+-> fsck
+--> run => build/fasttree fsck
+--> description => Zweryfikuj integralność store i manifestów w $FASTTREE_ROOT

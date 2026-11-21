@@ -12,5 +12,9 @@ mod ioengine
 mod oci
 mod composefs
 mod overlay
+mod repo
+mod fsck
+mod stats
+mod derive
 mod cli
 mod ft

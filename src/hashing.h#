@@ -3,9 +3,8 @@ use "std -> crypto" from "crypto"
 use "std -> env" from "env"
 
 ;; Hashe w tej bibliotece to 64-znakowe napisy hex (32 bajty, małe litery) —
-;; dokładnie to samo, co `$Hash` w oryginalnej wersji Nim. Dzięki temu nie
-;; potrzeba osobnego typu `Hash`, a format na dysku (manifest, store) jest
-;; identyczny.
+;; wystarczy zwykły `string`, osobny typ `Hash` nie jest potrzebny, a format na
+;; dysku (manifest, store) jest ten sam niezależnie od implementacji.
 
 ;; Nazwa algorytmu użytego w tym procesie. Domyślnie BLAKE3 (czysty H#);
 ;; ustaw FASTTREE_HASH=sha256, żeby wymusić odpowiednik `-d:fasttreeNoBlake3`

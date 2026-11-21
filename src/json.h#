@@ -134,7 +134,7 @@ fn pad(depth: int) -> string is
     return s
 end
 
-;; pretty = true -> format jak `pretty()` z Nim (wcięcie 2 spacje).
+;; pretty = true -> wcięcie 2 spacje.
 pub fn dump(j: J, pretty: bool, depth: int) -> string is
     let k: int = j.kind
     if k == 0 is return "null" end

@@ -12,6 +12,10 @@ mod oci
 mod composefs
 mod overlay
 mod cli
+mod repo
+mod fsck
+mod stats
+mod derive
 use "std -> fs" from "fs"
 
 ;; ═══════════════════════════════════════════════════════════════════════════
@@ -35,6 +39,8 @@ use "std -> fs" from "fs"
 ;; ═══════════════════════════════════════════════════════════════════════════
 
 pub fn abi_version() -> int is return 1 end
+;; Wersja addytywnych rozszerzeń ABI w ramach abi_version 1 (0.3: repo/fsck/stats, 0.4: repo_derive).
+pub fn abi_minor() -> int is return 2 end
 pub fn format_version() -> int is return 1 end
 pub fn hash_algo() -> string is return hashing::algo_name() end
 
@@ -339,6 +345,176 @@ pub fn gc_run(root: string, dry_run: bool) -> string is
     json::set(env, "liveObjects", json::jint(r.live_objects))
     json::set(env, "deletedObjects", json::jint(r.deleted_objects))
     json::set(env, "freedBytes", json::jint(r.freed_bytes))
+    return done(env)
+end
+
+;; ── Repo: tagi, pins, rollback (0.3) ────────────────────────────────────────
+
+fn str_array(xs: [string]) -> json::J is
+    let mut arr: [json::J] = []
+    let n: int = xs.len()
+    let mut i: int = 0
+    while i < n is
+        arr.push(json::jstr(xs[i]))
+        i += 1
+    end
+    return json::jarr(arr)
+end
+
+;; `root` = katalog repo FastTree (jak w gc_run). {"ok":true,"tags":[...],
+;; "current":"...","previous":"..."}.
+pub fn repo_tags(root: string) -> string is
+    let env: json::J = env_ok()
+    json::set(env, "tags", str_array(repo::list_tags(root)))
+    json::set(env, "current", json::jstr(repo::current_tag(root)))
+    json::set(env, "previous", json::jstr(repo::previous_tag(root)))
+    return done(env)
+end
+
+pub fn repo_pins(root: string) -> string is
+    let r: repo::PinsResult = repo::list_pins(root)
+    if !r.ok is return fail(r.error) end
+    let mut arr: [json::J] = []
+    let n: int = r.pins.len()
+    let mut i: int = 0
+    while i < n is
+        let p: repo::Pin = r.pins[i]
+        i += 1
+        let o: json::J = json::jobj()
+        json::set(o, "tag", json::jstr(p.tag))
+        json::set(o, "note", json::jstr(p.note))
+        json::set(o, "pinnedAt", json::jstr(p.pinned_at))
+        arr.push(o)
+    end
+    let env: json::J = env_ok()
+    json::set(env, "pins", json::jarr(arr))
+    return done(env)
+end
+
+pub fn repo_unpin(root: string, tag: string) -> string is
+    let r: repo::RepoResult = repo::unpin(root, tag)
+    if !r.ok is return fail(r.error) end
+    let env: json::J = env_ok()
+    json::set(env, "removed", json::jint(text::parse_int(r.value, 0)))
+    return done(env)
+end
+
+pub fn repo_rollback(root: string) -> string is
+    let r: repo::RepoResult = repo::rollback(root)
+    if !r.ok is return fail(r.error) end
+    let env: json::J = env_ok()
+    json::set(env, "tag", json::jstr(r.value))
+    return done(env)
+end
+
+pub fn repo_remove_tag(root: string, tag: string) -> string is
+    let r: repo::RepoResult = repo::remove_tag(root, tag)
+    if !r.ok is return fail(r.error) end
+    return done(env_ok())
+end
+
+;; Tworzy tag `new_tag` = `base_tag` + zawartość `changes_dir` (zwykły katalog,
+;; upperdir OverlayFS albo warstwa w stylu OCI). `root` = katalog repo.
+;; {"ok":true,"root":"<hash>","entries":N,"changed":N,"deleted":N}.
+pub fn repo_derive(root: string, base_tag: string, changes_dir: string, new_tag: string) -> string is
+    let r: derive::DeriveResult = derive::derive(root, base_tag, changes_dir, new_tag)
+    if !r.ok is return fail(r.error) end
+    let env: json::J = env_ok()
+    json::set(env, "root", json::jstr(r.root))
+    json::set(env, "entries", json::jint(r.entries))
+    json::set(env, "changed", json::jint(r.changed))
+    json::set(env, "deleted", json::jint(r.deleted))
+    return done(env)
+end
+
+;; ── fsck (0.3) ──────────────────────────────────────────────────────────────
+
+;; Weryfikuje hashe wszystkich obiektów store pod `store_root`; `repair`
+;; usuwa uszkodzone obiekty i porzucone *.tmp.*.
+pub fn fsck_store(store_root: string, repair: bool) -> string is
+    let o: store::OpenResult = store::open(store_root)
+    if !o.ok is return fail(o.error) end
+    let r: fsck::StoreFsck = fsck::check_store(o.store, repair)
+    if !r.ok is return fail(r.error) end
+    let env: json::J = env_ok()
+    json::set(env, "scanned", json::jint(r.scanned))
+    json::set(env, "totalBytes", json::jint(r.total_bytes))
+    json::set(env, "corrupt", str_array(r.corrupt))
+    json::set(env, "repaired", json::jint(r.repaired))
+    json::set(env, "tmpFiles", json::jint(r.tmp_files))
+    return done(env)
+end
+
+;; Sprawdza manifest (JSON) względem store: root, kolejność, brakujące chunki,
+;; zgodność rozmiarów. "clean" = true tylko gdy wszystko się zgadza.
+pub fn fsck_manifest(manifest_json: string, store_root: string) -> string is
+    let o: store::OpenResult = store::open(store_root)
+    if !o.ok is return fail(o.error) end
+    let p: manifest::ParseResult = manifest::from_json(manifest_json)
+    if !p.ok is return fail(p.error) end
+    let r: fsck::ManifestFsck = fsck::check_manifest(p.manifest, o.store)
+    let env: json::J = env_ok()
+    json::set(env, "clean", json::jbool(fsck::manifest_clean(r)))
+    json::set(env, "rootOk", json::jbool(r.root_ok))
+    json::set(env, "recomputedRoot", json::jstr(r.recomputed))
+    json::set(env, "entries", json::jint(r.entries))
+    json::set(env, "chunksChecked", json::jint(r.chunks_checked))
+    json::set(env, "missing", str_array(r.missing))
+    json::set(env, "sizeMismatch", str_array(r.size_mismatch))
+    json::set(env, "badOrder", json::jint(r.bad_order))
+    return done(env)
+end
+
+;; Pełny fsck repo pod `root`. "healthy" = brak problemów; "problems" =
+;; czytelne opisy.
+pub fn fsck_repo(root: string, repair: bool) -> string is
+    let r: fsck::RepoFsck = fsck::check_repo(root, repair)
+    if !r.ok is return fail(r.error) end
+    let env: json::J = env_ok()
+    json::set(env, "healthy", json::jbool(fsck::repo_healthy(r)))
+    json::set(env, "tags", json::jint(r.tags))
+    json::set(env, "scanned", json::jint(r.store.scanned))
+    json::set(env, "totalBytes", json::jint(r.store.total_bytes))
+    json::set(env, "repaired", json::jint(r.store.repaired))
+    json::set(env, "tmpFiles", json::jint(r.store.tmp_files))
+    json::set(env, "problems", str_array(r.problems))
+    return done(env)
+end
+
+;; ── Statystyki (0.3) ────────────────────────────────────────────────────────
+
+pub fn stats_manifest(manifest_json: string, store_root: string) -> string is
+    let o: store::OpenResult = store::open(store_root)
+    if !o.ok is return fail(o.error) end
+    let p: manifest::ParseResult = manifest::from_json(manifest_json)
+    if !p.ok is return fail(p.error) end
+    let st: stats::ManifestStats = stats::manifest_stats(p.manifest, o.store)
+    let env: json::J = env_ok()
+    json::set(env, "files", json::jint(st.files))
+    json::set(env, "executables", json::jint(st.executables))
+    json::set(env, "dirs", json::jint(st.dirs))
+    json::set(env, "symlinks", json::jint(st.symlinks))
+    json::set(env, "logicalBytes", json::jint(st.logical_bytes))
+    json::set(env, "chunkRefs", json::jint(st.chunk_refs))
+    json::set(env, "uniqueChunks", json::jint(st.unique_chunks))
+    json::set(env, "uniqueBytes", json::jint(st.unique_bytes))
+    json::set(env, "dedupRatioX100", json::jint(stats::ratio_x100(st.logical_bytes, st.unique_bytes)))
+    return done(env)
+end
+
+pub fn stats_repo(root: string) -> string is
+    let r: stats::RepoStats = stats::repo_stats(root)
+    if !r.ok is return fail(r.error) end
+    let env: json::J = env_ok()
+    json::set(env, "tags", json::jint(r.tags))
+    json::set(env, "storeObjects", json::jint(r.store_objects))
+    json::set(env, "storeBytes", json::jint(r.store_bytes))
+    json::set(env, "referencedObjects", json::jint(r.referenced_objects))
+    json::set(env, "referencedBytes", json::jint(r.referenced_bytes))
+    json::set(env, "orphanObjects", json::jint(r.orphan_objects))
+    json::set(env, "orphanBytes", json::jint(r.orphan_bytes))
+    json::set(env, "logicalBytes", json::jint(r.logical_bytes))
+    json::set(env, "gcReclaimableBytes", json::jint(r.gc_reclaimable))
     return done(env)
 end
 

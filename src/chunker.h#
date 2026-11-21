@@ -15,7 +15,7 @@ pub fn default_config() -> ChunkerConfig is
 end
 
 ;; Tablica gear: 256 stałych 64-bitowych z deterministycznego xorshift64
-;; (seed 0x2545F4914F6CDD1D) — identyczna jak w wersji Nim. H# nie ma
+;; (seed 0x2545F4914F6CDD1D) — format chunków jest częścią formatu na dysku. H# nie ma
 ;; logicznego `>>` dla u64, więc `seed >> 7` emulujemy: arytmetyczne
 ;; przesunięcie + maska 2^57-1 zerująca bity znaku.
 fn gear_table() -> [u64] is
@@ -42,9 +42,8 @@ end
 
 ;; Dzieli bufor na chunki wg FastCDC. `hash` NIGDY nie jest resetowany przy
 ;; cięciu wymuszonym przez max_size ani między chunkami "z zapomnieniem" —
-;; patrz komentarz w chunker.nim (reset hasha czyni granice zależnymi od
-;; pozycji, czego FastCDC ma unikać). Reset następuje tylko po cięciu
-;; wynikającym z maski, dokładnie jak w oryginale.
+;; reset hasha czyniłby granice zależnymi od pozycji, czego FastCDC ma
+;; unikać. Reset następuje tylko po cięciu wynikającym z maski.
 pub fn chunk_ranges(data: [int], cfg: ChunkerConfig) -> [Range] is
     let mut out: [Range] = []
     let n: int = data.len()

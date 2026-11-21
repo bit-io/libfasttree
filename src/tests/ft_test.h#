@@ -1,0 +1,229 @@
+use "std -> test" from "test"
+use "std -> env" from "env"
+mod check
+use "std -> fs" from "fs"
+mod text
+mod hashing
+mod chunker
+mod sys
+mod json
+mod store
+mod manifest
+mod layers
+mod gc
+mod ioengine
+mod oci
+mod composefs
+mod overlay
+mod repo
+mod fsck
+mod stats
+mod derive
+mod cli
+mod ft
+
+;; Testy rozszerzeń ABI 0.3 na poziomie H# (kształt i treść JSON). Warstwa
+;; symboli C (`ft_*`) wymaga backendu LLVM i jest sprawdzana osobno.
+
+fn setup(name: string) -> string is
+    let root: string = text::path_join(sys::tmp_dir(), "fasttree-h-ft-" + name + "-" + text::istr(sys::pid()))
+    sys::rm_rf(root)
+    fs::mkdir(text::path_join(root, "manifests"))
+    fs::mkdir(text::path_join(root, "deployments"))
+    return root
+end
+
+fn add_tag(root: string, tag: string, content: string) -> manifest::Manifest is
+    let o: store::OpenResult = store::open(text::path_join(root, "store"))
+    let src: string = root + "-src-" + tag
+    sys::rm_rf(src)
+    fs::mkdir(src)
+    let w: bool = fs::write(text::path_join(src, "f"), content)
+    let b: manifest::BuildResult = manifest::build_default(src, o.store)
+    let w2: bool = fs::write(manifest::manifest_path_in(root, tag), manifest::to_json(b.manifest))
+    sys::rm_rf(src)
+    return b.manifest
+end
+
+fn parse(s: string) -> json::J is
+    let p: json::Parsed = json::parse(s)
+    test::assert_true(p.ok)
+    return p.value
+end
+
+fn is_ok(j: json::J) -> bool is
+    let v: json::J = json::get(j, "ok")
+    return v.kind == 1 && v.n == 1
+end
+
+fn flag(j: json::J, key: string) -> bool is
+    let v: json::J = json::get(j, key)
+    return v.kind == 1 && v.n == 1
+end
+
+#[test]
+fn abi_versions() is
+    check::eq(text::istr(ft::abi_version()), "1")
+    check::eq(text::istr(ft::abi_minor()), "2")
+end
+
+#[test]
+fn repo_tags_envelope() is
+    let root: string = setup("tags")
+    let m: manifest::Manifest = add_tag(root, "v2", "b")
+    let m2: manifest::Manifest = add_tag(root, "v1", "a")
+    let w: bool = fs::write(text::path_join(root, "CURRENT_TAG"), "v2")
+    let j: json::J = parse(ft::repo_tags(root))
+    test::assert_true(is_ok(j))
+    let tags: json::J = json::get(j, "tags")
+    check::eq(text::istr(tags.items.len()), "2")
+    check::eq(json::as_str(tags.items[0], ""), "v1")
+    check::eq(json::as_str(tags.items[1], ""), "v2")
+    check::eq(json::as_str(json::get(j, "current"), "?"), "v2")
+    check::eq(json::as_str(json::get(j, "previous"), "?"), "")
+    sys::rm_rf(root)
+end
+
+#[test]
+fn repo_pins_unpin_roundtrip() is
+    let root: string = setup("pins")
+    let w: bool = fs::write(text::path_join(root, "pins.json"), "[{\"tag\": \"v1\", \"note\": \"n1\", \"pinnedAt\": \"t\"}]")
+    let j: json::J = parse(ft::repo_pins(root))
+    test::assert_true(is_ok(j))
+    let pins: json::J = json::get(j, "pins")
+    check::eq(text::istr(pins.items.len()), "1")
+    check::eq(json::as_str(json::get(pins.items[0], "note"), ""), "n1")
+    let u: json::J = parse(ft::repo_unpin(root, "v1"))
+    test::assert_true(is_ok(u))
+    check::eq(text::istr(json::as_int(json::get(u, "removed"), -1)), "1")
+    let u2: json::J = parse(ft::repo_unpin(root, "v1"))
+    check::eq(text::istr(json::as_int(json::get(u2, "removed"), -1)), "0")
+    sys::rm_rf(root)
+end
+
+#[test]
+fn repo_errors_use_failure_envelope() is
+    let root: string = setup("err")
+    let r: json::J = parse(ft::repo_rollback(root))
+    test::assert_false(is_ok(r))
+    test::assert_true(text::contains(json::as_str(json::get(r, "error"), ""), "CURRENT_TAG"))
+    let d: json::J = parse(ft::repo_remove_tag(root, "../zly"))
+    test::assert_false(is_ok(d))
+    sys::rm_rf(root)
+end
+
+#[test]
+fn repo_rollback_and_remove() is
+    let root: string = setup("rb")
+    let m: manifest::Manifest = add_tag(root, "v1", "a")
+    let m2: manifest::Manifest = add_tag(root, "v2", "b")
+    let w: bool = fs::write(text::path_join(root, "deployments/v1.erofs"), "i1")
+    let w2: bool = fs::write(text::path_join(root, "deployments/v2.erofs"), "i2")
+    let w3: bool = fs::write(text::path_join(root, "CURRENT_TAG"), "v2")
+    let w4: bool = fs::write(text::path_join(root, "PREVIOUS_TAG"), "v1")
+    let r: json::J = parse(ft::repo_rollback(root))
+    test::assert_true(is_ok(r))
+    check::eq(json::as_str(json::get(r, "tag"), ""), "v1")
+    let blocked: json::J = parse(ft::repo_remove_tag(root, "v1"))
+    test::assert_false(is_ok(blocked))
+    let ok: json::J = parse(ft::repo_remove_tag(root, "v2"))
+    test::assert_true(is_ok(ok))
+    test::assert_false(fs::exists(manifest::manifest_path_in(root, "v2")))
+    sys::rm_rf(root)
+end
+
+#[test]
+fn repo_derive_envelope() is
+    let root: string = setup("dv")
+    let m: manifest::Manifest = add_tag(root, "base", "baza")
+    let ch: string = root + "-changes"
+    fs::mkdir(ch)
+    let w: bool = fs::write(ch + "/extra", "extra")
+    let j: json::J = parse(ft::repo_derive(root, "base", ch, "plus"))
+    test::assert_true(is_ok(j))
+    check::eq(text::istr(json::as_int(json::get(j, "changed"), -1)), "1")
+    check::eq(text::istr(json::as_int(json::get(j, "entries"), -1)), "2")
+    test::assert_true(fs::exists(manifest::manifest_path_in(root, "plus")))
+    let again: json::J = parse(ft::repo_derive(root, "base", ch, "plus"))
+    test::assert_false(is_ok(again))
+    sys::rm_rf(root)
+    sys::rm_rf(ch)
+end
+
+#[test]
+fn fsck_store_envelope() is
+    let root: string = setup("fs")
+    let m: manifest::Manifest = add_tag(root, "v1", "tresc")
+    let sroot: string = text::path_join(root, "store")
+    let clean: json::J = parse(ft::fsck_store(sroot, false))
+    test::assert_true(is_ok(clean))
+    check::eq(text::istr(json::as_int(json::get(clean, "scanned"), -1)), "1")
+    check::eq(text::istr(json::get(clean, "corrupt").items.len()), "0")
+    let o: store::OpenResult = store::open(sroot)
+    let h: string = m.entries[0].chunks[0]
+    let w: bool = fs::write(store::object_path(o.store, h), "inna!")
+    let bad: json::J = parse(ft::fsck_store(sroot, true))
+    check::eq(text::istr(json::get(bad, "corrupt").items.len()), "1")
+    check::eq(json::as_str(json::get(bad, "corrupt").items[0], ""), h)
+    check::eq(text::istr(json::as_int(json::get(bad, "repaired"), -1)), "1")
+    sys::rm_rf(root)
+end
+
+#[test]
+fn fsck_manifest_envelope() is
+    let root: string = setup("fm")
+    let m: manifest::Manifest = add_tag(root, "v1", "tresc")
+    let sroot: string = text::path_join(root, "store")
+    let txt: string = manifest::to_json(m)
+    let j: json::J = parse(ft::fsck_manifest(txt, sroot))
+    test::assert_true(is_ok(j))
+    test::assert_true(flag(j, "clean"))
+    test::assert_true(flag(j, "rootOk"))
+    check::eq(json::as_str(json::get(j, "recomputedRoot"), ""), m.root)
+    let o: store::OpenResult = store::open(sroot)
+    let d: bool = store::delete_object(o.store, m.entries[0].chunks[0])
+    let j2: json::J = parse(ft::fsck_manifest(txt, sroot))
+    test::assert_false(flag(j2, "clean"))
+    check::eq(text::istr(json::get(j2, "missing").items.len()), "1")
+    let j3: json::J = parse(ft::fsck_manifest("nie json", sroot))
+    test::assert_false(is_ok(j3))
+    sys::rm_rf(root)
+end
+
+#[test]
+fn fsck_repo_envelope() is
+    let root: string = setup("fr")
+    let m: manifest::Manifest = add_tag(root, "v1", "tresc")
+    let ok: json::J = parse(ft::fsck_repo(root, false))
+    test::assert_true(is_ok(ok))
+    test::assert_true(flag(ok, "healthy"))
+    check::eq(text::istr(json::as_int(json::get(ok, "tags"), -1)), "1")
+    let w: bool = fs::write(text::path_join(root, "CURRENT_TAG"), "brak")
+    let bad: json::J = parse(ft::fsck_repo(root, false))
+    test::assert_true(is_ok(bad))
+    test::assert_false(flag(bad, "healthy"))
+    check::eq(text::istr(json::get(bad, "problems").items.len()), "1")
+    sys::rm_rf(root)
+end
+
+#[test]
+fn stats_envelopes() is
+    let root: string = setup("st")
+    let m: manifest::Manifest = add_tag(root, "v1", "dwanascie bz")
+    let sroot: string = text::path_join(root, "store")
+    let a: json::J = parse(ft::stats_manifest(manifest::to_json(m), sroot))
+    test::assert_true(is_ok(a))
+    check::eq(text::istr(json::as_int(json::get(a, "files"), -1)), "1")
+    check::eq(text::istr(json::as_int(json::get(a, "logicalBytes"), -1)), "12")
+    check::eq(text::istr(json::as_int(json::get(a, "uniqueChunks"), -1)), "1")
+    check::eq(text::istr(json::as_int(json::get(a, "dedupRatioX100"), -1)), "100")
+    let b: json::J = parse(ft::stats_repo(root))
+    test::assert_true(is_ok(b))
+    check::eq(text::istr(json::as_int(json::get(b, "tags"), -1)), "1")
+    check::eq(text::istr(json::as_int(json::get(b, "storeObjects"), -1)), "1")
+    check::eq(text::istr(json::as_int(json::get(b, "orphanObjects"), -1)), "0")
+    sys::rm_rf(root)
+end
+
+fn main() is
+end

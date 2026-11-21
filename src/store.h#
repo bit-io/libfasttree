@@ -7,8 +7,8 @@ use "std -> fs" from "fs"
 ;;   <root>/FORMAT                       — wersja layoutu (ASCII)
 ;;   <root>/objects/<hex[0:2]>/<hex[2:]> — jeden plik = jeden obiekt (surowe
 ;;                                         bajty chunku, bez nagłówka)
-;; Identyczne z wersją Nim — store utworzony przez jedną implementację jest
-;; w pełni czytelny dla drugiej.
+;; Layout jest zamrożony: store utworzony przez dowolną wersję 0.x jest w pełni
+;; czytelny dla każdej innej.
 
 pub fn format_version() -> int is return 1 end
 

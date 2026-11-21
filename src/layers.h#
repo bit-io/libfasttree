@@ -4,7 +4,7 @@ use "std -> fs" from "fs"
 use "std -> collections" from "col"
 
 ;; Rozpakowywanie i scalanie warstw OCI (semantyka whiteoutów wg OCI image
-;; spec) — port layers.nim. Narzędzia zewnętrzne: GNU tar, cp.
+;; spec) Narzędzia zewnętrzne: GNU tar, cp.
 
 pub struct LayerResult is
     pub ok:    bool

@@ -7,7 +7,7 @@ mod json
 use "std -> fs" from "fs"
 use "std -> collections" from "col"
 
-;; Manifest = drzewo Merkle całego rootfs (format v1, identyczny z Nim):
+;; Manifest = drzewo Merkle całego rootfs (format v1):
 ;;   entries[] posortowane po `path` (porównanie bajtowe),
 ;;   entryHash(e) = hashChildren([hash(path|mode), chunks...]),
 ;;   root = hashChildren(entryHash(e) dla e w entries).
@@ -66,7 +66,7 @@ pub fn compute_root(entries: [FileEntry]) -> string is
     return hashing::hash_children(hs)
 end
 
-;; Sortowanie przez scalanie po `path` (bajtowo, jak `cmp` z Nim).
+;; Sortowanie przez scalanie po `path` (bajtowo).
 pub fn sort_entries(xs: [FileEntry]) -> [FileEntry] is
     let n: int = xs.len()
     if n <= 1 is return xs end

@@ -11,9 +11,13 @@ mod ioengine
 mod oci
 mod composefs
 mod overlay
+mod repo
+mod fsck
+mod stats
+mod derive
 use "std -> fs" from "fs"
 
-;; CLI `fasttree` — port cli.nim. Każda komenda zwraca kod wyjścia procesu
+;; CLI `fasttree` Każda komenda zwraca kod wyjścia procesu
 ;; (0 = sukces); błędy idą na stderr jako "[fasttree] błąd: ...".
 
 pub fn root_dir() -> string is
@@ -46,7 +50,7 @@ pub fn manifest_path(tag: string) -> string is
     return text::path_join(text::path_join(root_dir(), "manifests"), tag + ".json")
 end
 
-pub fn cmd_pull(image_ref: string) -> int is
+pub fn cmd_pull(image_ref: string, alias: string) -> int is
     ensure_layout()
     let root: string = root_dir()
     say("[fasttree] pull " + image_ref)
@@ -54,7 +58,11 @@ pub fn cmd_pull(image_ref: string) -> int is
     if !so.ok is return fail(so.error) end
     let rr: oci::RefResult = oci::parse_image_ref(image_ref)
     if !rr.ok is return fail(rr.error) end
-    let tag: string = sanitize_tag(rr.ref.reference)
+    let mut tag: string = sanitize_tag(rr.ref.reference)
+    if alias != "" is
+        if !repo::valid_tag(alias) is return fail("niepoprawna nazwa taga w --as: '" + alias + "'") end
+        tag = alias
+    end
 
     ;; 1. Warstwy (cache blobów OCI niezależny od dedupu chunków).
     let res: oci::ResolveResult = oci::resolve_image_layers(rr.ref, text::path_join(root, "layers-cache"))
@@ -346,8 +354,285 @@ pub fn cmd_overlay_diff(name: string) -> int is
     return 0
 end
 
+;; ── Rozszerzenia 0.3: snapshot, list, stats, fsck, verify, diff, checkout,
+;;    rollback, pins/unpin, rm ────────────────────────────────────────────────
+
+pub fn version() -> string is return "0.4.0" end
+
+;; Drukuje wpisy diff w formacie wspólnym dla `status --diff` i `diff`.
+fn print_diff_entries(d: [manifest::DiffEntry]) is
+    let dn: int = d.len()
+    let mut i: int = 0
+    while i < dn is
+        let e: manifest::DiffEntry = d[i]
+        i += 1
+        let kind: string = e.kind
+        let p: string = e.path
+        if kind == "added" is
+            say("  + " + p + "  (" + text::istr(e.new_chunks) + " chunków)")
+        else if kind == "removed" is
+            say("  - " + p + "  (" + text::istr(e.old_chunks) + " chunków)")
+        else is
+            say("  ~ " + p + "  (" + text::istr(e.old_chunks) + " -> " + text::istr(e.new_chunks) + " chunków, " + text::istr(e.reused_chunks) + " reużytych)")
+        end
+    end
+end
+
+;; Buduje manifest z lokalnego katalogu (bez rejestru OCI): chunki do CAS,
+;; manifest do manifests/<tag>.json. Przydatne do testów i do własnych drzew.
+pub fn cmd_snapshot(dir: string, tag: string) -> int is
+    ensure_layout()
+    if !repo::valid_tag(tag) is return fail("niepoprawna nazwa taga: '" + tag + "'") end
+    if !fs::is_dir(dir) is return fail("'" + dir + "' nie jest katalogiem") end
+    let root: string = root_dir()
+    let so: store::OpenResult = store::open(text::path_join(root, "store"))
+    if !so.ok is return fail(so.error) end
+    let br: manifest::BuildResult = manifest::build_default(dir, so.store)
+    if !br.ok is return fail(br.error) end
+    let mpath: string = manifest::manifest_path_in(root, tag)
+    if !fs::write(mpath, manifest::to_json(br.manifest)) is return fail("nie można zapisać " + mpath) end
+    let n: int = br.manifest.entries.len()
+    say("[fasttree] snapshot '" + tag + "': " + text::istr(n) + " wpisów, root=" + br.manifest.root)
+    return 0
+end
+
+pub fn cmd_list() -> int is
+    ensure_layout()
+    let root: string = root_dir()
+    let tags: [string] = repo::list_tags(root)
+    let n: int = tags.len()
+    if n == 0 is
+        say("[fasttree] brak manifestów (użyj 'fasttree pull' lub 'fasttree snapshot')")
+        return 0
+    end
+    let cur: string = repo::current_tag(root)
+    let prev: string = repo::previous_tag(root)
+    say("[fasttree] " + text::istr(n) + " tag(ów):")
+    let mut i: int = 0
+    while i < n is
+        let t: string = tags[i]
+        i += 1
+        let mut marks: [string] = []
+        if t == cur is marks.push("current") end
+        if t == prev is marks.push("previous") end
+        if repo::is_pinned(root, t) is marks.push("pinned") end
+        let mn: int = marks.len()
+        if mn == 0 is
+            say("  " + t)
+        else is
+            say("  " + t + "  [" + text::join(marks, ", ") + "]")
+        end
+    end
+    return 0
+end
+
+pub fn cmd_pins() -> int is
+    ensure_layout()
+    let r: repo::PinsResult = repo::list_pins(root_dir())
+    if !r.ok is return fail(r.error) end
+    let n: int = r.pins.len()
+    if n == 0 is
+        say("[fasttree] brak przypięć")
+        return 0
+    end
+    say("[fasttree] " + text::istr(n) + " przypięć:")
+    let mut i: int = 0
+    while i < n is
+        let p: repo::Pin = r.pins[i]
+        i += 1
+        say("  " + p.tag + "  " + p.pinned_at + "  " + p.note)
+    end
+    return 0
+end
+
+pub fn cmd_unpin(tag: string) -> int is
+    ensure_layout()
+    let r: repo::RepoResult = repo::unpin(root_dir(), tag)
+    if !r.ok is return fail(r.error) end
+    if r.value == "0" is
+        say("[fasttree] '" + tag + "' nie był przypięty")
+    else is
+        say("[fasttree] zdjęto przypięcie '" + tag + "' (" + r.value + " wpis(ów))")
+    end
+    return 0
+end
+
+pub fn cmd_rollback() -> int is
+    ensure_layout()
+    let r: repo::RepoResult = repo::rollback(root_dir())
+    if !r.ok is return fail(r.error) end
+    say("[fasttree] wycofano do '" + r.value + "' (current -> " + text::path_join(text::path_join(root_dir(), "deployments"), r.value + ".erofs") + ")")
+    return 0
+end
+
+pub fn cmd_rm(tag: string) -> int is
+    ensure_layout()
+    let r: repo::RepoResult = repo::remove_tag(root_dir(), tag)
+    if !r.ok is return fail(r.error) end
+    say("[fasttree] usunięto tag '" + tag + "' (chunki zostają w store do 'fasttree gc')")
+    return 0
+end
+
+;; Nowy tag = baza + katalog zmian (patrz derive.h#).
+pub fn cmd_derive(base_tag: string, changes_dir: string, new_tag: string) -> int is
+    ensure_layout()
+    let r: derive::DeriveResult = derive::derive(root_dir(), sanitize_tag(base_tag), changes_dir, new_tag)
+    if !r.ok is return fail(r.error) end
+    say("[fasttree] derive: '" + new_tag + "' = '" + base_tag + "' + " + text::istr(r.changed) + " zmian, " + text::istr(r.deleted) + " usunięć; " + text::istr(r.entries) + " wpisów, root=" + r.root)
+    say("[fasttree] gotowe do 'fasttree deploy " + new_tag + "'")
+    return 0
+end
+
+;; Zapisuje zmiany z overlaya (upperdir) na aktywnym wdrożeniu jako nowy tag.
+pub fn cmd_overlay_commit(name: string, new_tag: string) -> int is
+    ensure_layout()
+    let root: string = root_dir()
+    let cur: string = repo::current_tag(root)
+    if cur == "" is return fail("brak aktywnego wdrożenia (CURRENT_TAG) — nie ma bazy dla zmian") end
+    let ovs: [overlay::OverlayInfo] = overlay::list_active_overlays(root)
+    let n: int = ovs.len()
+    let mut i: int = 0
+    while i < n is
+        let info: overlay::OverlayInfo = ovs[i]
+        i += 1
+        if info.name == name is
+            let r: derive::DeriveResult = derive::derive(root, cur, info.upperdir, new_tag)
+            if !r.ok is return fail(r.error) end
+            say("[fasttree] overlay '" + name + "' zapisany jako tag '" + new_tag + "' (baza '" + cur + "', " + text::istr(r.changed) + " zmian, " + text::istr(r.deleted) + " usunięć, root=" + r.root + ")")
+            return 0
+        end
+    end
+    return fail("nie znaleziono overlaya '" + name + "' (patrz 'fasttree overlay list')")
+end
+
+pub fn cmd_diff(a: string, b: string) -> int is
+    ensure_layout()
+    let ma: manifest::ParseResult = manifest::load(manifest_path(sanitize_tag(a)))
+    if !ma.ok is return fail(ma.error) end
+    let mb: manifest::ParseResult = manifest::load(manifest_path(sanitize_tag(b)))
+    if !mb.ok is return fail(mb.error) end
+    let d: [manifest::DiffEntry] = manifest::diff(ma.manifest, mb.manifest)
+    let dn: int = d.len()
+    if dn == 0 is
+        say("[fasttree] diff " + a + " -> " + b + ": drzewa identyczne")
+        return 0
+    end
+    say("[fasttree] diff " + a + " -> " + b + ": " + text::istr(dn) + " zmienionych ścieżek")
+    print_diff_entries(d)
+    return 0
+end
+
+;; Odtwarza drzewo taga ze store do nieistniejącego katalogu `dest`.
+pub fn cmd_checkout(tag: string, dest: string) -> int is
+    ensure_layout()
+    let root: string = root_dir()
+    let so: store::OpenResult = store::open(text::path_join(root, "store"))
+    if !so.ok is return fail(so.error) end
+    let pr: manifest::ParseResult = manifest::load(manifest_path(sanitize_tag(tag)))
+    if !pr.ok is return fail(pr.error) end
+    if sys::exists_any(dest) is return fail("'" + dest + "' już istnieje — podaj nieistniejący katalog docelowy") end
+    let r: composefs::CfsResult = composefs::materialize_tree(pr.manifest, so.store, dest)
+    if !r.ok is
+        sys::rm_rf(dest)
+        return fail(r.error)
+    end
+    let n: int = pr.manifest.entries.len()
+    say("[fasttree] odtworzono '" + tag + "' (" + text::istr(n) + " wpisów) w " + dest)
+    return 0
+end
+
+;; Weryfikuje jeden manifest względem store. Kod 1 przy jakimkolwiek problemie.
+pub fn cmd_verify(tag: string) -> int is
+    ensure_layout()
+    let root: string = root_dir()
+    let so: store::OpenResult = store::open(text::path_join(root, "store"))
+    if !so.ok is return fail(so.error) end
+    let pr: manifest::ParseResult = manifest::load(manifest_path(sanitize_tag(tag)))
+    if !pr.ok is return fail(pr.error) end
+    if pr.warning != "" is say("[fasttree] ostrzeżenie: " + pr.warning) end
+    let r: fsck::ManifestFsck = fsck::check_manifest(pr.manifest, so.store)
+    if fsck::manifest_clean(r) is
+        say("[fasttree] verify '" + tag + "': OK (" + text::istr(r.entries) + " wpisów, " + text::istr(r.chunks_checked) + " chunków, root zgodny)")
+        return 0
+    end
+    let mut rootok: bool = r.root_ok
+    if !rootok is say("[fasttree] verify '" + tag + "': root NIE zgadza się (zapisany " + pr.manifest.root + ", policzony " + r.recomputed + ")") end
+    let nm: int = r.missing.len()
+    if nm > 0 is say("[fasttree] verify '" + tag + "': brakuje " + text::istr(nm) + " chunków w store") end
+    let ns: int = r.size_mismatch.len()
+    if ns > 0 is say("[fasttree] verify '" + tag + "': " + text::istr(ns) + " plików o niezgodnym rozmiarze, np. " + r.size_mismatch[0]) end
+    let bo: int = r.bad_order
+    if bo > 0 is say("[fasttree] verify '" + tag + "': " + text::istr(bo) + " wpisów w złej kolejności/zduplikowanych") end
+    sys::eprint("[fasttree] błąd: manifest '" + tag + "' jest uszkodzony lub niekompletny")
+    return 1
+end
+
+pub fn cmd_fsck(repair: bool) -> int is
+    ensure_layout()
+    let mut mode: string = ""
+    if repair is mode = " --repair" end
+    say("[fasttree] fsck" + mode + ": sprawdzam store i manifesty...")
+    let r: fsck::RepoFsck = fsck::check_repo(root_dir(), repair)
+    if !r.ok is return fail(r.error) end
+    say("[fasttree] store: " + text::istr(r.store.scanned) + " obiektów (" + stats::human_bytes(r.store.total_bytes) + "), manifestów: " + text::istr(r.tags))
+    let tmp: int = r.store.tmp_files
+    if tmp > 0 is
+        if repair is
+            say("[fasttree] usunięto " + text::istr(tmp) + " porzuconych plików tymczasowych")
+        else is
+            say("[fasttree] " + text::istr(tmp) + " porzuconych plików tymczasowych (usuwa je 'fsck --repair')")
+        end
+    end
+    if fsck::repo_healthy(r) is
+        say("[fasttree] fsck: repozytorium zdrowe")
+        return 0
+    end
+    let n: int = r.problems.len()
+    let mut i: int = 0
+    while i < n is
+        say("  ! " + r.problems[i])
+        i += 1
+    end
+    sys::eprint("[fasttree] błąd: fsck wykrył " + text::istr(n) + " problem(ów)")
+    return 1
+end
+
+pub fn cmd_stats(tag: string) -> int is
+    ensure_layout()
+    let root: string = root_dir()
+    if tag == "" is
+        let r: stats::RepoStats = stats::repo_stats(root)
+        if !r.ok is return fail(r.error) end
+        say("[fasttree] store: " + text::istr(r.store_objects) + " obiektów, " + stats::human_bytes(r.store_bytes))
+        say("[fasttree] manifestów: " + text::istr(r.tags) + ", rozmiar logiczny łącznie: " + stats::human_bytes(r.logical_bytes))
+        say("[fasttree] używane przez manifesty: " + text::istr(r.referenced_objects) + " obiektów, " + stats::human_bytes(r.referenced_bytes))
+        say("[fasttree] sieroty (poza manifestami): " + text::istr(r.orphan_objects) + " obiektów, " + stats::human_bytes(r.orphan_bytes))
+        say("[fasttree] 'gc' zwolniłby teraz: " + stats::human_bytes(r.gc_reclaimable))
+        return 0
+    end
+    let so: store::OpenResult = store::open(text::path_join(root, "store"))
+    if !so.ok is return fail(so.error) end
+    let pr: manifest::ParseResult = manifest::load(manifest_path(sanitize_tag(tag)))
+    if !pr.ok is return fail(pr.error) end
+    let st: stats::ManifestStats = stats::manifest_stats(pr.manifest, so.store)
+    say("[fasttree] '" + tag + "': " + text::istr(st.files) + " plików (" + text::istr(st.executables) + " wykonywalnych), " + text::istr(st.dirs) + " katalogów, " + text::istr(st.symlinks) + " symlinków")
+    say("[fasttree] rozmiar logiczny: " + stats::human_bytes(st.logical_bytes) + ", unikalne chunki: " + text::istr(st.unique_chunks) + " z " + text::istr(st.chunk_refs) + " odwołań (" + stats::human_bytes(st.unique_bytes) + ")")
+    say("[fasttree] deduplikacja wewnątrz taga: " + stats::fmt_ratio(stats::ratio_x100(st.logical_bytes, st.unique_bytes)))
+    return 0
+end
+
 pub fn usage() -> string is
-    return "fasttree — content-addressable następca OSTree\n\nUżycie:\n  fasttree pull <registry>/<repo>:<tag>\n  fasttree status [--diff]\n  fasttree deploy <tag> [--atomic]\n  fasttree pin <tag> \"<notatka>\"\n  fasttree gc [--dry-run]\n  fasttree overlay create <nazwa> [--ephemeral]\n  fasttree overlay remove <nazwa>\n  fasttree overlay list\n  fasttree overlay diff <nazwa>"
+    return "fasttree — content-addressable następca OSTree\n\nUżycie:\n  fasttree pull <registry>/<repo>:<tag> [--as <nazwa>]\n  fasttree status [--diff]\n  fasttree deploy <tag> [--atomic]\n  fasttree pin <tag> \"<notatka>\"\n  fasttree gc [--dry-run]\n  fasttree overlay create <nazwa> [--ephemeral]\n  fasttree overlay remove <nazwa>\n  fasttree overlay list\n  fasttree overlay diff <nazwa>\n  fasttree snapshot <katalog> <tag>\n  fasttree list\n  fasttree stats [tag]\n  fasttree fsck [--repair]\n  fasttree verify <tag>\n  fasttree diff <tag-a> <tag-b>\n  fasttree checkout <tag> <katalog>\n  fasttree rollback\n  fasttree pins\n  fasttree unpin <tag>\n  fasttree rm <tag>\n  fasttree derive <tag-bazowy> <katalog-zmian> <nowy-tag>\n  fasttree overlay commit <nazwa> <nowy-tag>\n  fasttree version"
+end
+
+fn flag_value(args: [string], flag: string) -> string is
+    let n: int = args.len()
+    let mut i: int = 0
+    while i + 1 < n is
+        if args[i] == flag is return args[i + 1] end
+        i += 1
+    end
+    return ""
 end
 
 fn has_flag(args: [string], flag: string) -> bool is
@@ -370,7 +655,7 @@ pub fn run(args: [string]) -> int is
             say(usage())
             return 1
         end
-        return cmd_pull(args[1])
+        return cmd_pull(args[1], flag_value(args, "--as"))
     end
     if cmd == "status" is return cmd_status(has_flag(args, "--diff")) end
     if cmd == "deploy" is
@@ -388,6 +673,67 @@ pub fn run(args: [string]) -> int is
         return cmd_pin(args[1], args[2])
     end
     if cmd == "gc" is return cmd_gc(has_flag(args, "--dry-run")) end
+    if cmd == "version" || cmd == "--version" is
+        say("fasttree " + version())
+        return 0
+    end
+    if cmd == "snapshot" is
+        if n < 3 is
+            say(usage())
+            return 1
+        end
+        return cmd_snapshot(args[1], args[2])
+    end
+    if cmd == "list" is return cmd_list() end
+    if cmd == "pins" is return cmd_pins() end
+    if cmd == "rollback" is return cmd_rollback() end
+    if cmd == "fsck" is return cmd_fsck(has_flag(args, "--repair")) end
+    if cmd == "stats" is
+        if n >= 2 is return cmd_stats(args[1]) end
+        return cmd_stats("")
+    end
+    if cmd == "unpin" is
+        if n < 2 is
+            say(usage())
+            return 1
+        end
+        return cmd_unpin(args[1])
+    end
+    if cmd == "rm" is
+        if n < 2 is
+            say(usage())
+            return 1
+        end
+        return cmd_rm(args[1])
+    end
+    if cmd == "verify" is
+        if n < 2 is
+            say(usage())
+            return 1
+        end
+        return cmd_verify(args[1])
+    end
+    if cmd == "diff" is
+        if n < 3 is
+            say(usage())
+            return 1
+        end
+        return cmd_diff(args[1], args[2])
+    end
+    if cmd == "derive" is
+        if n < 4 is
+            say(usage())
+            return 1
+        end
+        return cmd_derive(args[1], args[2], args[3])
+    end
+    if cmd == "checkout" is
+        if n < 3 is
+            say(usage())
+            return 1
+        end
+        return cmd_checkout(args[1], args[2])
+    end
     if cmd == "overlay" is
         if n < 2 is
             say(usage())
@@ -407,6 +753,13 @@ pub fn run(args: [string]) -> int is
                 return 1
             end
             return cmd_overlay_remove(args[2])
+        end
+        if sub == "commit" is
+            if n < 4 is
+                say(usage())
+                return 1
+            end
+            return cmd_overlay_commit(args[2], args[3])
         end
         if sub == "list" is return cmd_overlay_list() end
         if sub == "diff" is

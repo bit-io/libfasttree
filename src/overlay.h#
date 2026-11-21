@@ -4,7 +4,7 @@ use "std -> fs" from "fs"
 use "std -> process" from "proc"
 
 ;; OverlayFS: trwałe i ulotne (tmpfs) nakładki na obraz tylko-do-odczytu —
-;; port overlay.nim. Wymaga uprawnień do `mount`.
+;; wymaga uprawnień do `mount`.
 
 pub struct Overlay is
     pub lowerdir:   string

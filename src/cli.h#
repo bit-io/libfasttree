@@ -15,6 +15,12 @@ mod repo
 mod fsck
 mod stats
 mod derive
+mod layout
+mod lmanifest
+mod pkgstore
+mod tools
+mod deployment
+mod lcli
 use "std -> fs" from "fs"
 
 ;; CLI `fasttree` Każda komenda zwraca kod wyjścia procesu
@@ -357,7 +363,7 @@ end
 ;; ── Rozszerzenia 0.3: snapshot, list, stats, fsck, verify, diff, checkout,
 ;;    rollback, pins/unpin, rm ────────────────────────────────────────────────
 
-pub fn version() -> string is return "0.4.0" end
+pub fn version() -> string is return "0.5.0" end
 
 ;; Drukuje wpisy diff w formacie wspólnym dla `status --diff` i `diff`.
 fn print_diff_entries(d: [manifest::DiffEntry]) is
@@ -650,6 +656,7 @@ pub fn run(args: [string]) -> int is
         return 1
     end
     let cmd: string = args[0]
+    if lcli::is_legendary_cmd(cmd) is return lcli::run(args) end
     if cmd == "pull" is
         if n < 2 is
             say(usage())

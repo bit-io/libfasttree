@@ -1,0 +1,200 @@
+mod text
+mod sys
+mod layout
+mod lmanifest
+mod pkgstore
+mod tools
+mod deployment
+use "std -> fs" from "fs"
+
+;; Komendy LegendaryOS w CLI `fasttree` (rozszerzenie 0.5):
+;;   fasttree layout init|check|links [--root DIR]
+;;   fasttree manifest check|show <plik.toml>
+;;   fasttree pkg list|generations|rollback|gc [--dry-run]|prune <ile>
+;;   fasttree tool list|pack <nazwa> <git> <entry> [rev]|mount <nazwa>|umount <nazwa>|rm <nazwa>
+;;   fasttree deployments
+
+fn say(s: string) is write(s) end
+
+fn fail(s: string) -> int is
+    sys::eprint("[fasttree] błąd: " + s)
+    return 1
+end
+
+fn root_from(args: [string]) -> layout::Layout is
+    let mut i: int = 0
+    while i + 1 < args.len() is
+        if args[i] == "--root" is return layout::at(args[i + 1]) end
+        i += 1
+    end
+    return layout::default_layout()
+end
+
+fn has_flag(args: [string], f: string) -> bool is
+    let mut i: int = 0
+    while i < args.len() is
+        if args[i] == f is return true end
+        i += 1
+    end
+    return false
+end
+
+pub fn usage() -> string is
+    return "fasttree layout init|check|links [--root DIR]\nfasttree manifest check|show <plik.toml>\nfasttree pkg list|generations|rollback|gc [--dry-run]|prune <ile>\nfasttree tool list|pack <nazwa> <git> <entry> [rev]|mount <nazwa>|umount <nazwa>|rm <nazwa>\nfasttree deployments"
+end
+
+pub fn is_legendary_cmd(cmd: string) -> bool is
+    return cmd == "layout" || cmd == "manifest" || cmd == "pkg" || cmd == "tool" || cmd == "deployments"
+end
+
+pub fn run(args: [string]) -> int is
+    let cmd: string = args[0]
+    let n: int = args.len()
+    let l: layout::Layout = root_from(args)
+    if cmd == "layout" is
+        if n < 2 is
+            say(usage())
+            return 1
+        end
+        if args[1] == "init" is
+            let r: layout::LayoutResult = layout::ensure(l)
+            if !r.ok is return fail(r.error) end
+            say("utworzono " + text::istr(r.created.len()) + " katalogów w " + l.root)
+            return 0
+        end
+        if args[1] == "links" is
+            let made: [string] = layout::apply_compat_links(l)
+            say("utworzono " + text::istr(made.len()) + " symlinków zgodności")
+            return 0
+        end
+        if args[1] == "check" is
+            let p: [string] = layout::validate(l)
+            let mut i: int = 0
+            while i < p.len() is
+                say("  ! " + p[i])
+                i += 1
+            end
+            if p.len() == 0 is
+                say("układ poprawny")
+                return 0
+            end
+            return 1
+        end
+        return fail("nieznana podkomenda layout: " + args[1])
+    end
+    if cmd == "manifest" is
+        if n < 3 is
+            say(usage())
+            return 1
+        end
+        let m: lmanifest::ParseResult = lmanifest::load(args[2])
+        if !m.ok is return fail(m.error) end
+        if args[1] == "show" is
+            say(lmanifest::emit(m.doc))
+            return 0
+        end
+        let p: [string] = lmanifest::validate_manifest(m.doc)
+        let mut i: int = 0
+        while i < p.len() is
+            say("  ! " + p[i])
+            i += 1
+        end
+        if p.len() == 0 is
+            say("manifest poprawny")
+            return 0
+        end
+        return 1
+    end
+    if cmd == "pkg" is
+        if n < 2 is
+            say(usage())
+            return 1
+        end
+        let sub: string = args[1]
+        if sub == "list" is
+            let s: [string] = pkgstore::list_store(l)
+            let mut i: int = 0
+            while i < s.len() is
+                say(s[i])
+                i += 1
+            end
+            return 0
+        end
+        if sub == "generations" is
+            let g: [int] = pkgstore::list_generations(l)
+            let cur: int = pkgstore::current_generation(l)
+            let mut i: int = 0
+            while i < g.len() is
+                let mark: string = ""
+                if g[i] == cur is say(text::istr(g[i]) + "  [current]") else is say(text::istr(g[i])) end
+                i += 1
+            end
+            return 0
+        end
+        if sub == "rollback" is
+            let r: pkgstore::ProfileResult = pkgstore::profile_rollback(l)
+            if !r.ok is return fail(r.error) end
+            say("profil: generacja " + text::istr(r.generation))
+            return 0
+        end
+        if sub == "gc" is
+            let r: pkgstore::PkgGcResult = pkgstore::gc(l, has_flag(args, "--dry-run"))
+            if !r.ok is return fail(r.error) end
+            say("zachowano " + text::istr(r.kept) + ", do usunięcia/usunięto " + text::istr(r.removed.len()))
+            return 0
+        end
+        if sub == "prune" is
+            if n < 3 is return fail("pkg prune <ile>") end
+            let k: int = pkgstore::profile_prune(l, text::parse_int(args[2], 3))
+            say("usunięto " + text::istr(k) + " generacji")
+            return 0
+        end
+        return fail("nieznana podkomenda pkg: " + sub)
+    end
+    if cmd == "tool" is
+        if n < 2 is
+            say(usage())
+            return 1
+        end
+        let sub: string = args[1]
+        if sub == "list" is
+            let t: [string] = tools::list(l)
+            let mut i: int = 0
+            while i < t.len() is
+                say(t[i])
+                i += 1
+            end
+            return 0
+        end
+        if sub == "pack" is
+            if n < 5 is return fail("tool pack <nazwa> <git> <entry> [rev]") end
+            let mut rev: string = ""
+            if n >= 6 && !text::starts_with(args[5], "--") is rev = args[5] end
+            let r: tools::ToolResult = tools::pack(l, tools::ToolSpec { name: args[2], git: args[3], rev: rev, entry: args[4], build: "" })
+            if !r.ok is return fail(r.error) end
+            say(r.name + " @ " + r.commit + " -> " + r.sqfs + " (" + text::istr(r.size) + " B)")
+            return 0
+        end
+        if sub == "mount" || sub == "umount" || sub == "rm" is
+            if n < 3 is return fail("tool " + sub + " <nazwa>") end
+            let mut e: string = ""
+            if sub == "mount" is e = tools::mount_tool(l, args[2]) end
+            if sub == "umount" is e = tools::umount_tool(l, args[2]) end
+            if sub == "rm" is e = tools::remove(l, args[2]) end
+            if e != "" is return fail(e) end
+            return 0
+        end
+        return fail("nieznana podkomenda tool: " + sub)
+    end
+    if cmd == "deployments" is
+        let rs: [deployment::Record] = deployment::list_records(l)
+        let mut i: int = 0
+        while i < rs.len() is
+            let r: deployment::Record = rs[i]
+            say(r.tag + "  gen=" + text::istr(r.generation) + "  " + r.kind + "  " + r.status + "  parent=" + r.parent)
+            i += 1
+        end
+        return 0
+    end
+    return fail("nieznana komenda: " + cmd)
+end

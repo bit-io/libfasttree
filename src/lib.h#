@@ -16,5 +16,12 @@ mod repo
 mod fsck
 mod stats
 mod derive
+mod hk
+mod layout
+mod lmanifest
+mod pkgstore
+mod tools
+mod deployment
+mod lcli
 mod cli
 mod ft

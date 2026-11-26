@@ -1,0 +1,221 @@
+mod text
+mod sys
+mod layout
+mod hk
+mod toolfetch
+use "std -> fs" from "fs"
+
+;; ═══════════════════════════════════════════════════════════════════════════
+;;  toolbox — /tools jako JEDEN obraz squashfs.
+;;
+;;  Wszystkie narzędzia (bit, hackerc, h#, ngt, hco, getit, hedit, zenitd, lpm, legendary, nula, instalator,
+;;  aplikacje desktopowe…) leżą w jednym archiwum squashfs (zstd). Nic się nie rozpakowuje: obraz jest
+;;  montowany (loop, ro) na /tools, bloki dekompresuje jądro leniwie, a całość waży mniej niż osobne pliki.
+;;
+;;  Obraz fabryczny:    <root>/tools/tools.sqfs            (część obrazu systemu; montowany NA <root>/tools)
+;;  Obraz zaktualizowany: <root>/state/tools/tools.sqfs    (zapisuje `lpm tools update`; ma pierwszeństwo)
+;;
+;;  Wewnątrz obrazu:
+;;    bin/<nazwa>                      pliki wykonywalne (jeden płaski katalog — dodaj /tools/bin do PATH)
+;;    share/applications/<id>.desktop  wpisy menu aplikacji desktopowych
+;;    TOOLS.hk                         indeks: wersje, sumy sha256, źródła, edycja
+;;
+;;  Montowanie obrazu NA katalogu, w którym leży plik, jest bezpieczne: plik jest już otwarty przez urządzenie loop.
+;;  Podmiana obrazu = umount + mount nowego (aktualizacja działa po restarcie albo `lpm tools mount-all --remount`).
+;; ═══════════════════════════════════════════════════════════════════════════
+
+pub fn factory_image(l: layout::Layout) -> string is return text::path_join(l.tools, "tools.sqfs") end
+pub fn override_image(l: layout::Layout) -> string is return text::path_join(text::path_join(l.state, "tools"), "tools.sqfs") end
+
+;; Obraz, który ma być zamontowany: aktualizacja (jeśli poprawna) albo fabryczny. "" gdy żadnego nie ma.
+pub fn active_image(l: layout::Layout) -> string is
+    let o: string = override_image(l)
+    if fs::exists(o) && verify_image(o) == "" is return o end
+    let f: string = factory_image(l)
+    if fs::exists(f) is return f end
+    return ""
+end
+
+fn magic_hex(path: string) -> string is
+    let r: sys::Exec = sys::exec("head -c 4 " + sys::sq(path) + " | od -An -tx1 | tr -d ' \\n'")
+    return text::trim(r.out)
+end
+
+;; "" gdy plik wygląda na poprawny obraz squashfs (magic "hsqs"); inaczej opis problemu.
+pub fn verify_image(path: string) -> string is
+    if !fs::exists(path) is return "brak pliku " + path end
+    if fs::size(path) < 96 is return "obraz zbyt mały" end
+    let m: string = magic_hex(path)
+    if m != "68737173" && m != "73717368" is return "to nie jest squashfs (magic " + m + ")" end
+    return ""
+end
+
+pub fn is_mounted(l: layout::Layout) -> bool is
+    return sys::ok("mountpoint -q " + sys::sq(l.tools))
+end
+
+;; Buduje obraz squashfs z katalogu stage (bin/, share/, TOOLS.hk). Wynik: [błąd, rozmiar, sha256].
+pub fn pack(stage: string, out_image: string) -> [string] is
+    if !fs::is_dir(stage) is return ["katalog stage nie istnieje: " + stage, "0", ""] end
+    if !sys::have_tool("mksquashfs") is return ["brak mksquashfs (pakiet squashfs-tools)", "0", ""] end
+    if !fs::exists(text::path_join(stage, "TOOLS.hk")) is return ["stage nie ma TOOLS.hk", "0", ""] end
+    sys::mkdir_p(text::dirname(out_image))
+    let tmp: string = out_image + ".new." + text::istr(sys::pid())
+    sys::rm_f(tmp)
+    let base: string = "mksquashfs " + sys::sq(stage) + " " + sys::sq(tmp) + " -noappend -quiet -no-progress -all-root -no-xattrs -b 262144 "
+    let mut m: sys::Exec = sys::exec(base + "-comp zstd -Xcompression-level 19")
+    if m.code != 0 is
+        m = sys::exec(base + "-comp xz")
+    end
+    if m.code != 0 is
+        sys::rm_f(tmp)
+        return ["mksquashfs nie powiodło się: " + text::trim(m.out), "0", ""]
+    end
+    let ve: string = verify_image(tmp)
+    if ve != "" is
+        sys::rm_f(tmp)
+        return [ve, "0", ""]
+    end
+    let size: int = fs::size(tmp)
+    let sha: string = toolfetch::sha256_of(tmp)
+    let mv: sys::Exec = sys::exec("mv -f -- " + sys::sq(tmp) + " " + sys::sq(out_image))
+    if mv.code != 0 is
+        sys::rm_f(tmp)
+        return ["nie można zapisać " + out_image, "0", ""]
+    end
+    return ["", text::istr(size), sha]
+end
+
+;; Montuje aktywny obraz na <root>/tools (ro). Idempotentne. root=/ : mount -t squashfs -o loop; inaczej squashfuse.
+pub fn mount(l: layout::Layout) -> string is
+    if is_mounted(l) is return "" end
+    let img: string = active_image(l)
+    if img == "" is return "brak obrazu narzędzi (" + factory_image(l) + ")" end
+    let ve: string = verify_image(img)
+    if ve != "" is return img + ": " + ve end
+    sys::mkdir_p(l.tools)
+    let r: sys::Exec = sys::exec("mount -t squashfs -o ro,loop " + sys::sq(img) + " " + sys::sq(l.tools))
+    if r.code == 0 is return "" end
+    if sys::have_tool("squashfuse") is
+        let f: sys::Exec = sys::exec("squashfuse -o ro,allow_other " + sys::sq(img) + " " + sys::sq(l.tools))
+        if f.code == 0 is return "" end
+        return "mount: " + text::trim(r.out) + "; squashfuse: " + text::trim(f.out)
+    end
+    return "mount: " + text::trim(r.out)
+end
+
+pub fn umount(l: layout::Layout) -> string is
+    if !is_mounted(l) is return "" end
+    let r: sys::Exec = sys::exec("umount " + sys::sq(l.tools))
+    if r.code != 0 is return text::trim(r.out) end
+    return ""
+end
+
+;; Ponowne zamontowanie (po aktualizacji obrazu). Zajęty punkt montowania => błąd z opisem.
+pub fn remount(l: layout::Layout) -> string is
+    let u: string = umount(l)
+    if u != "" is return "nie można odmontować /tools (czy narzędzie jest uruchomione?): " + u end
+    return mount(l)
+end
+
+;; Instaluje nowy obraz jako aktualizację (atomowo, po weryfikacji). "" albo błąd.
+pub fn install_override(l: layout::Layout, new_image: string) -> string is
+    let ve: string = verify_image(new_image)
+    if ve != "" is return ve end
+    let dst: string = override_image(l)
+    sys::mkdir_p(text::dirname(dst))
+    let tmp: string = dst + ".new." + text::istr(sys::pid())
+    let c: sys::Exec = sys::exec("cp -f -- " + sys::sq(new_image) + " " + sys::sq(tmp) + " && sync -- " + sys::sq(tmp) + " 2>/dev/null; mv -f -- " + sys::sq(tmp) + " " + sys::sq(dst))
+    if c.code != 0 is
+        sys::rm_f(tmp)
+        return "zapis aktualizacji nie powiódł się: " + text::trim(c.out)
+    end
+    return ""
+end
+
+pub fn remove_override(l: layout::Layout) is
+    sys::rm_f(override_image(l))
+end
+
+;; ── Indeks TOOLS.hk (wewnątrz obrazu) ───────────────────────────────────────
+
+pub fn index_path(l: layout::Layout) -> string is return text::path_join(l.tools, "TOOLS.hk") end
+
+pub fn bin_path(l: layout::Layout, name: string) -> string is
+    return text::path_join(text::path_join(l.tools, "bin"), name)
+end
+
+;; Nazwa narzędzia bezpieczna do ścieżki (bez '/', '..', zaczynająca się od litery/cyfry).
+pub fn valid_name(s: string) -> bool is
+    if s.len() == 0 || s.len() > 64 is return false end
+    if text::starts_with(s, ".") || text::starts_with(s, "-") is return false end
+    return toolfetch::safe_name(s)
+end
+
+;; Zamontuj (jeśli trzeba) i zwróć ścieżkę pliku wykonywalnego albo "".
+pub fn path_of(l: layout::Layout, name: string) -> string is
+    if !valid_name(name) is return "" end
+    let m: string = mount(l)
+    if m != "" is return "" end
+    let p: string = bin_path(l, name)
+    if fs::exists(p) is return p end
+    return ""
+end
+
+;; Wiersze TSV z TOOLS.hk: nazwa, wersja, rodzaj, sha256 (wymaga zamontowanego obrazu).
+pub fn list(l: layout::Layout) -> [string] is
+    let t: string = __builtin_char_code_to_str(9)
+    let mut out: [string] = []
+    let ip: string = index_path(l)
+    if !fs::exists(ip) is return out end
+    let ks: [string] = hk::keys(hk::load(ip).doc, "tools")
+    let d: hk::Doc = hk::load(ip).doc
+    let mut i: int = 0
+    while i < ks.len() is
+        let k: string = ks[i]
+        i += 1
+        if text::ends_with(k, ".version") is
+            let id: string = k[0..k.len() - 8]
+            out.push(id + t + hk::get(d, "tools", id + ".version", "") + t + hk::get(d, "tools", id + ".kind", "cli") + t + hk::get(d, "tools", id + ".sha256", "") + t + hk::get(d, "tools", id + ".as", id))
+        end
+    end
+    return out
+end
+
+pub fn index_get(l: layout::Layout, section: string, key: string) -> string is
+    return hk::get(hk::load(index_path(l)).doc, section, key, "")
+end
+
+;; Wiersze `fetch_catalog` (status OK/WARN) -> katalog stage (bin/, share/applications, TOOLS.hk).
+;; Zwraca [błąd] albo [""] ; pliki .desktop powstają dla kind=desktop.
+pub fn stage_build(stage: string, rows: [string], catalog: string, edition: string, version: string, created: string) -> string is
+    let t: string = __builtin_char_code_to_str(9)
+    sys::rm_rf(stage)
+    sys::mkdir_p(text::path_join(stage, "bin"))
+    sys::mkdir_p(text::path_join(stage, "share/applications"))
+    let q: string = __builtin_char_code_to_str(34)
+    let mut idx: string = "! TOOLS.hk — indeks obrazu /tools (generowany; nie edytuj)\n[image]\n-> edition => " + edition + "\n-> os_version => " + version + "\n-> created => " + created + "\n\n[tools]\n"
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < rows.len() is
+        let f: [string] = text::split(rows[i], t)
+        i += 1
+        if f.len() >= 10 && (f[0] == "OK" || f[0] == "WARN") is
+            let id: string = f[1]
+            let as_name: string = f[2]
+            let file: string = f[9]
+            if !valid_name(as_name) is return "niepoprawna nazwa narzędzia: " + as_name end
+            let cp: sys::Exec = sys::exec("install -D -m 0755 -- " + sys::sq(file) + " " + sys::sq(text::path_join(text::path_join(stage, "bin"), as_name)))
+            if cp.code != 0 is return "kopiowanie " + id + ": " + text::trim(cp.out) end
+            idx = idx + "-> " + id + "\n--> as => " + as_name + "\n--> version => " + f[3] + "\n--> sha256 => " + f[5] + "\n--> kind => " + f[8] + "\n--> bytes => " + f[4] + "\n--> source => " + f[6] + "\n"
+            if f[8] == "desktop" || f[8] == "installer" is
+                let dt: string = "[Desktop Entry]\nType=Application\nName=" + toolfetch::load_entry(catalog, id).title + "\nExec=/tools/bin/" + as_name + "\nTerminal=false\nCategories=System;\nX-LegendaryOS-Tool=" + id + "\n"
+                let w: bool = fs::write(text::path_join(text::path_join(stage, "share/applications"), id + ".desktop"), dt)
+            end
+            n += 1
+        end
+    end
+    if n == 0 is return "żadne narzędzie nie trafiło do obrazu (stage pusty)" end
+    if !fs::write(text::path_join(stage, "TOOLS.hk"), idx) is return "nie można zapisać TOOLS.hk" end
+    return ""
+end

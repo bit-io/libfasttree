@@ -1,0 +1,459 @@
+use "std -> fs" from "fs"
+mod text
+mod sys
+mod store
+mod manifest
+mod layers
+mod oci
+mod composefs
+mod repo
+mod layout
+mod lmanifest
+mod deployment
+mod tools
+mod toolfetch
+mod toolbox
+mod hk
+mod pkgstore
+
+;; ═══════════════════════════════════════════════════════════════════════════
+;;  api — fasada biblioteki libfasttree dla kodu H# (lpm, lepm, builder).
+;;
+;;  Po co: `fasttree` jako program CLI nie może być wołany przez lpm ani builder
+;;  (zasada projektu: libfasttree = BIBLIOTEKA, `use "bit -> libfasttree"`).
+;;  CLI (`cli.h#`) jest cienką nakładką na te same funkcje.
+;;
+;;  Konwencje (celowo proste — omijają ograniczenie H# 0.9, zob. Z-SHARP-GAPS N2:
+;;  struktury z typami z aliasu biblioteki przechodzą w C++ w `Any`):
+;;    * WSZYSTKIE parametry i wyniki to typy proste: string, int, bool, [string];
+;;    * funkcje zwracają napis błędu — "" oznacza sukces;
+;;    * nic nie jest drukowane (wołający decyduje o interfejsie), nic nie czyta
+;;      zmiennych środowiskowych — katalog repozytorium (`ft_root`) jest argumentem;
+;;    * pliki .hk/.toml są identyfikowane ścieżką (parsowane przy każdym wywołaniu —
+;;      pliki konfiguracyjne są małe).
+;;
+;;  Użycie (tylko w pliku wejściowym projektu — zob. docs/USING-AS-LIBRARY.md):
+;;      use "bit -> libfasttree" from "ft"
+;;      let err: string = ft::api::snapshot(ft_root, rootfs, tag)
+;; ═══════════════════════════════════════════════════════════════════════════
+
+pub fn version() -> string is return "0.7.0" end
+
+fn tab() -> string is return __builtin_char_code_to_str(9) end
+
+;; Tworzy podkatalogi repozytorium FastTree (store, manifests, deployments, layers-cache).
+pub fn ensure_repo(ft_root: string) is
+    sys::mkdir_p(text::path_join(ft_root, "store"))
+    sys::mkdir_p(text::path_join(ft_root, "deployments"))
+    sys::mkdir_p(text::path_join(ft_root, "manifests"))
+    sys::mkdir_p(text::path_join(ft_root, "layers-cache"))
+end
+
+;; ── Obrazy: snapshot / pull / deploy / rollback ─────────────────────────────
+
+;; Manifest + chunki CAS z lokalnego katalogu → manifests/<tag>.json. Zastępuje `fasttree snapshot`.
+pub fn snapshot(ft_root: string, dir: string, tag: string) -> string is
+    if !repo::valid_tag(tag) is return "niepoprawna nazwa taga: '" + tag + "'" end
+    if !fs::is_dir(dir) is return "'" + dir + "' nie jest katalogiem" end
+    ensure_repo(ft_root)
+    let so: store::OpenResult = store::open(text::path_join(ft_root, "store"))
+    if !so.ok is return so.error end
+    let br: manifest::BuildResult = manifest::build_default(dir, so.store)
+    if !br.ok is return br.error end
+    let mpath: string = manifest::manifest_path_in(ft_root, tag)
+    if !fs::write(mpath, manifest::to_json(br.manifest)) is return "nie można zapisać " + mpath end
+    return ""
+end
+
+;; Liczba wpisów manifestu taga (-1 gdy brak/uszkodzony) — do raportów.
+pub fn manifest_entries(ft_root: string, tag: string) -> int is
+    let p: string = manifest::manifest_path_in(ft_root, tag)
+    if !fs::exists(p) is return 0 - 1 end
+    let pr: manifest::ParseResult = manifest::load(p)
+    if !pr.ok is return 0 - 1 end
+    return pr.manifest.entries.len()
+end
+
+;; Pobranie obrazu OCI do repozytorium (warstwy → scalenie → manifest). Zastępuje `fasttree pull`.
+;; `alias` = "" → tag z referencji. Zwraca błąd albo "".
+pub fn pull(ft_root: string, image_ref: string, alias: string) -> string is
+    ensure_repo(ft_root)
+    let so: store::OpenResult = store::open(text::path_join(ft_root, "store"))
+    if !so.ok is return so.error end
+    let rr: oci::RefResult = oci::parse_image_ref(image_ref)
+    if !rr.ok is return rr.error end
+    let mut tag: string = text::join(text::split(rr.ref.reference, ":"), "_")
+    if alias != "" is
+        if !repo::valid_tag(alias) is return "niepoprawna nazwa taga: '" + alias + "'" end
+        tag = alias
+    end
+    let res: oci::ResolveResult = oci::resolve_image_layers(rr.ref, text::path_join(ft_root, "layers-cache"))
+    if !res.ok is return res.error end
+    let mut paths: [string] = []
+    let mut i: int = 0
+    while i < res.layers.len() is
+        let rl: oci::ResolvedLayer = res.layers[i]
+        paths.push(rl.path)
+        i += 1
+    end
+    let work: string = text::path_join(text::path_join(sys::tmp_dir(), "fasttree-pull"), tag)
+    sys::rm_rf(work)
+    let merged: string = text::path_join(work, "merged")
+    let lr: layers::LayerResult = layers::materialize_layers(paths, text::path_join(work, "layers"), merged)
+    if !lr.ok is return lr.error end
+    let br: manifest::BuildResult = manifest::build_default(merged, so.store)
+    if !br.ok is return br.error end
+    let mpath: string = manifest::manifest_path_in(ft_root, tag)
+    if !fs::write(mpath, manifest::to_json(br.manifest)) is return "nie można zapisać " + mpath end
+    sys::rm_rf(work)
+    return ""
+end
+
+;; Obraz composefs (EROFS) + dm-verity + podmiana `current`. `atomic` = symlink pod
+;; nazwą tymczasową + rename(2). Zastępuje `fasttree deploy <tag> --atomic`.
+pub fn deploy(ft_root: string, tag: string, atomic: bool) -> string is
+    ensure_repo(ft_root)
+    let so: store::OpenResult = store::open(text::path_join(ft_root, "store"))
+    if !so.ok is return so.error end
+    let mpath: string = manifest::manifest_path_in(ft_root, tag)
+    if !fs::exists(mpath) is return "brak manifestu dla '" + tag + "' (najpierw pull albo snapshot)" end
+    let pr: manifest::ParseResult = manifest::load(mpath)
+    if !pr.ok is return pr.error end
+    let deploy_dir: string = text::path_join(text::path_join(ft_root, "deployments"), tag)
+    let image: string = deploy_dir + ".erofs"
+    let br: composefs::CfsResult = composefs::build_image(pr.manifest, so.store, deploy_dir + ".materialized", image)
+    if !br.ok is return br.error end
+    if !fs::write(image + ".digest", br.value) is return "nie można zapisać " + image + ".digest" end
+    let v: composefs::DmVerityInfo = composefs::dm_verity_format(image)
+    if !v.ok is return v.error end
+    if !fs::write(image + ".veritysum", v.root_hash) is return "nie można zapisać " + image + ".veritysum" end
+    let link: string = text::path_join(ft_root, "current")
+    if atomic is
+        let tmp: string = link + ".tmp"
+        if sys::exists_any(tmp) is sys::rm_f(tmp) end
+        if !sys::symlink(image, tmp) is return "nie można utworzyć symlinku " + tmp end
+        fs::rename(tmp, link)
+    else is
+        if sys::exists_any(link) is sys::rm_f(link) end
+        if !sys::symlink(image, link) is return "nie można utworzyć symlinku " + link end
+    end
+    ;; PREVIOUS_TAG musi być zapisany PRZED nadpisaniem CURRENT_TAG.
+    let cur_f: string = text::path_join(ft_root, "CURRENT_TAG")
+    if fs::exists(cur_f) is
+        let prev: string = text::trim(fs::read(cur_f))
+        if prev != tag is
+            let w: bool = fs::write(text::path_join(ft_root, "PREVIOUS_TAG"), prev)
+        end
+    end
+    if !fs::write(cur_f, tag) is return "nie można zapisać CURRENT_TAG" end
+    return ""
+end
+
+;; Cofnięcie do poprzedniego wdrożenia. Wynik: [błąd, tag] (błąd "" = OK).
+pub fn rollback(ft_root: string) -> [string] is
+    let r: repo::RepoResult = repo::rollback(ft_root)
+    if !r.ok is return [r.error, ""] end
+    return ["", r.value]
+end
+
+pub fn current_tag(ft_root: string) -> string is return repo::current_tag(ft_root) end
+pub fn previous_tag(ft_root: string) -> string is return repo::previous_tag(ft_root) end
+pub fn valid_tag(tag: string) -> bool is return repo::valid_tag(tag) end
+pub fn list_tags(ft_root: string) -> [string] is return repo::list_tags(ft_root) end
+
+;; ── Układ LegendaryOS (/system /state /packages /tools /home) ───────────────
+
+;; Tworzy brakujące korzenie i podkatalogi `/state`. "" albo błąd.
+pub fn layout_ensure(root: string) -> string is
+    let r: layout::LayoutResult = layout::ensure(layout::at(root))
+    if !r.ok is return r.error end
+    return ""
+end
+
+;; Symlinki zgodności (usr→system, bin/sbin/lib/lib64→system/…, etc/var→state/…). Zwraca listę utworzonych.
+pub fn layout_apply_compat(root: string) -> [string] is
+    return layout::apply_compat_links(layout::at(root))
+end
+
+;; Lista problemów układu (pusta = poprawny).
+pub fn layout_validate(root: string) -> [string] is
+    return layout::validate(layout::at(root))
+end
+
+;; remount,rw / ro dla /state /packages /tools na czas transakcji lpm (no-op poza punktami montowania).
+pub fn layout_unlock(root: string) -> string is return layout::unlock_mutable(layout::at(root)) end
+pub fn layout_lock(root: string) -> string is return layout::lock_mutable(layout::at(root)) end
+
+pub fn path_state_etc(root: string) -> string is return layout::state_etc(layout::at(root)) end
+pub fn path_ft_root(root: string) -> string is return layout::ft_root(layout::at(root)) end
+pub fn path_lpm_dir(root: string) -> string is return layout::lpm_dir(layout::at(root)) end
+pub fn path_lpm_cache(root: string) -> string is return layout::lpm_cache(layout::at(root)) end
+pub fn path_system(root: string) -> string is return layout::at(root).system end
+
+;; ── manifest.toml obrazu ────────────────────────────────────────────────────
+
+fn kv(f: [string], key: string, dflt: string) -> string is
+    let mut i: int = 0
+    while i < f.len() is
+        let p: [string] = text::split_once(f[i], "=")
+        if p.len() == 2 && p[0] == key is return p[1] end
+        i += 1
+    end
+    return dflt
+end
+
+;; Zapisuje manifest.toml systemu bazowego. `fields` = lista "klucz=wartość":
+;;   name version base_release arch channel tag created   (wymagane: name version tag)
+;;   desktop.environment=…  deployment.base=…             ("sekcja.klucz=wartość" = dodatkowe pola)
+;; Walidacja `lmanifest::validate_manifest` (m.in. init.service_manager == zenitd). "" albo błąd.
+pub fn os_manifest_write(path: string, fields: [string]) -> string is
+    let gen: int = text::parse_int(kv(fields, "generation", "1"), 1)
+    let n: lmanifest::NewOs = lmanifest::NewOs { name: kv(fields, "name", ""), version: kv(fields, "version", ""),
+        base: kv(fields, "base", "fedora"), base_release: kv(fields, "base_release", "43"),
+        arch: kv(fields, "arch", "x86_64"), channel: kv(fields, "channel", "rolling"),
+        tag: kv(fields, "tag", ""), parent: kv(fields, "parent", ""), generation: gen,
+        kind: kv(fields, "kind", "base"), created: kv(fields, "created", "") }
+    let mut d: lmanifest::Doc = lmanifest::new_os_manifest(n)
+    let mut i: int = 0
+    while i < fields.len() is
+        let p: [string] = text::split_once(fields[i], "=")
+        if p.len() == 2 is
+            let sk: [string] = text::split_once(p[0], ".")
+            if sk.len() == 2 is d = lmanifest::put_str(d, sk[0], sk[1], p[1]) end
+        end
+        i += 1
+    end
+    let probs: [string] = lmanifest::validate_manifest(d)
+    if probs.len() > 0 is return "manifest.toml: " + probs[0] end
+    return lmanifest::save(path, d)
+end
+
+;; Rejestruje obraz bazowy w <root>/state/deployments (rekord wdrożenia z manifestu). "" albo błąd.
+pub fn register_base(root: string, tag: string, manifest_path: string, now: string) -> string is
+    let pr: lmanifest::ParseResult = lmanifest::load(manifest_path)
+    if !pr.ok is return pr.error end
+    return deployment::register_base(layout::at(root), tag, pr.doc, now)
+end
+
+;; Wdrożenie warstwowe: baza + drzewo zmian → nowy tag (derive). `layers` = "nazwa|nevra|repo".
+;; Wynik: błąd albo "".
+pub fn stage_layered(root: string, base_tag: string, changes_dir: string, new_tag: string,
+                     layer_specs: [string], now: string) -> string is
+    let mut ls: [deployment::Layer] = []
+    let mut i: int = 0
+    while i < layer_specs.len() is
+        let p: [string] = text::split(layer_specs[i], "|")
+        if p.len() == 3 is ls.push(deployment::new_layer(p[0], p[1], p[2])) end
+        i += 1
+    end
+    let st: deployment::StageResult = deployment::stage_layered(layout::at(root), base_tag, changes_dir, new_tag, ls, now)
+    if !st.ok is return st.error end
+    return ""
+end
+
+pub fn mark_deployed(root: string, tag: string) -> string is return deployment::mark_deployed(layout::at(root), tag) end
+pub fn set_deployment_status(root: string, tag: string, status: string) -> string is
+    return deployment::set_status(layout::at(root), tag, status)
+end
+
+;; Generacja wdrożenia taga (0 gdy brak rekordu).
+pub fn deployment_generation(root: string, tag: string) -> int is
+    return deployment::load_record(layout::at(root), tag).generation
+end
+pub fn deployment_kind(root: string, tag: string) -> string is
+    return deployment::load_record(layout::at(root), tag).kind
+end
+pub fn deployment_parent(root: string, tag: string) -> string is
+    return deployment::load_record(layout::at(root), tag).parent
+end
+pub fn deployment_status(root: string, tag: string) -> string is
+    return deployment::load_record(layout::at(root), tag).status
+end
+
+;; Wszystkie wdrożenia jako linie "tag<TAB>generacja<TAB>kind<TAB>status".
+pub fn deployments(root: string) -> [string] is
+    let rs: [deployment::Record] = deployment::list_records(layout::at(root))
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < rs.len() is
+        out.push(rs[i].tag + tab() + text::istr(rs[i].generation) + tab() + rs[i].kind + tab() + rs[i].status)
+        i += 1
+    end
+    return out
+end
+
+;; ── /tools (repo git → squashfs) ────────────────────────────────────────────
+
+;; Pakuje narzędzie do <root>/tools/<name>. Wynik: [błąd, commit, rozmiar_bajtów].
+pub fn tool_pack(root: string, name: string, git: string, rev: string, entry: string, build: string) -> [string] is
+    let t: tools::ToolResult = tools::pack(layout::at(root), tools::new_spec(name, git, rev, entry, build))
+    if !t.ok is return [t.error, "", "0"] end
+    return ["", t.commit, text::istr(t.size)]
+end
+pub fn tool_list(root: string) -> [string] is return tools::list(layout::at(root)) end
+pub fn tool_mount(root: string, name: string) -> string is return tools::mount_tool(layout::at(root), name) end
+pub fn tool_remove(root: string, name: string) -> string is return tools::remove(layout::at(root), name) end
+pub fn tool_entry_path(root: string, name: string) -> string is return tools::entry_path(layout::at(root), name) end
+pub fn tool_missing_prereqs() -> string is return tools::missing_pack_tools() end
+
+;; ── /tools jako jeden obraz squashfs (toolbox) + pobieranie binarek (toolfetch) ──────────────
+
+;; Katalog narzędzi: problemy (puste = OK).
+pub fn tb_catalog_check(catalog: string) -> [string] is return toolfetch::validate_catalog(catalog) end
+;; Wpisy katalogu dla edycji (TSV: id, as, kind, required, system, version-spec, repo, title).
+pub fn tb_catalog_list(catalog: string, edition: string, exclude: [string]) -> [string] is
+    return toolfetch::list_catalog(catalog, edition, exclude)
+end
+;; Pobiera narzędzia edycji do cache. Wiersze TSV: OK|WARN|ERR, id, as, wersja, bajty, sha256, źródło, system, kind, plik, komunikat
+;; (pierwszy wiersz "#manifest"). local_dir: katalog z gotowymi binarkami (""=brak); offline: tylko cache/local.
+pub fn tb_fetch(catalog: string, edition: string, exclude: [string], cache: string, local_dir: string, offline: bool) -> [string] is
+    return toolfetch::fetch_catalog(catalog, edition, exclude, cache, local_dir, offline)
+end
+;; Składa katalog stage (bin/, share/applications, TOOLS.hk) z wierszy tb_fetch. "" albo błąd.
+pub fn tb_stage(stage: string, rows: [string], catalog: string, edition: string, version: string, created: string) -> string is
+    return toolbox::stage_build(stage, rows, catalog, edition, version, created)
+end
+;; stage -> jeden obraz squashfs. [błąd, rozmiar, sha256]
+pub fn tb_pack(stage: string, image: string) -> [string] is return toolbox::pack(stage, image) end
+pub fn tb_verify(image: string) -> string is return toolbox::verify_image(image) end
+pub fn tb_active_image(root: string) -> string is return toolbox::active_image(layout::at(root)) end
+pub fn tb_factory_image(root: string) -> string is return toolbox::factory_image(layout::at(root)) end
+pub fn tb_override_image(root: string) -> string is return toolbox::override_image(layout::at(root)) end
+pub fn tb_mount(root: string) -> string is return toolbox::mount(layout::at(root)) end
+pub fn tb_umount(root: string) -> string is return toolbox::umount(layout::at(root)) end
+pub fn tb_remount(root: string) -> string is return toolbox::remount(layout::at(root)) end
+pub fn tb_is_mounted(root: string) -> bool is return toolbox::is_mounted(layout::at(root)) end
+pub fn tb_install_override(root: string, image: string) -> string is return toolbox::install_override(layout::at(root), image) end
+pub fn tb_remove_override(root: string) is toolbox::remove_override(layout::at(root)) end
+;; Ścieżka pliku wykonywalnego (montuje obraz) albo "".
+pub fn tb_path(root: string, name: string) -> string is return toolbox::path_of(layout::at(root), name) end
+;; TSV: nazwa, wersja, rodzaj, sha256, as (z zamontowanego TOOLS.hk)
+pub fn tb_list(root: string) -> [string] is return toolbox::list(layout::at(root)) end
+pub fn tb_index_get(root: string, section: string, key: string) -> string is return toolbox::index_get(layout::at(root), section, key) end
+pub fn tb_sha256(path: string) -> string is return toolfetch::sha256_of(path) end
+pub fn tb_manifest_version(src: string, key: string) -> string is return toolfetch::manifest_version(src, key) end
+pub fn tb_bithk_version(src: string) -> string is return toolfetch::bithk_version(src) end
+
+;; ── pliki konfiguracyjne .hk ────────────────────────────────────────────────
+
+;; "" gdy plik istnieje i poprawnie się parsuje; inaczej opis błędu (z numerem linii).
+pub fn hk_check(path: string) -> string is
+    if !fs::exists(path) is return "brak pliku " + path end
+    let r: hk::ParseResult = hk::parse(fs::read(path))
+    if !r.ok is return path + ": " + r.error end
+    return ""
+end
+
+fn hk_doc(path: string) -> hk::Doc is
+    if !fs::exists(path) is return hk::empty() end
+    let r: hk::ParseResult = hk::parse(fs::read(path))
+    if !r.ok is return hk::empty() end
+    return r.doc
+end
+
+pub fn hk_get(path: string, section: string, key: string, dflt: string) -> string is
+    return hk::get(hk_doc(path), section, key, dflt)
+end
+pub fn hk_get_int(path: string, section: string, key: string, dflt: int) -> int is
+    return hk::get_int(hk_doc(path), section, key, dflt)
+end
+pub fn hk_get_bool(path: string, section: string, key: string, dflt: bool) -> bool is
+    return hk::get_bool(hk_doc(path), section, key, dflt)
+end
+pub fn hk_list(path: string, section: string, key: string) -> [string] is
+    return hk::get_list(hk_doc(path), section, key)
+end
+pub fn hk_has(path: string, section: string, key: string) -> bool is
+    return hk::has(hk_doc(path), section, key)
+end
+;; Klucze sekcji (zagnieżdżone: "grupa.klucz").
+pub fn hk_keys(path: string, section: string) -> [string] is
+    return hk::keys(hk_doc(path), section)
+end
+pub fn hk_sections(path: string) -> [string] is
+    return hk::sections(hk_doc(path))
+end
+
+pub fn tool_is_mounted(root: string, name: string) -> bool is return tools::is_mounted(layout::at(root), name) end
+
+;; Pole [tool] z tool.toml zainstalowanego narzędzia (git, rev, entry, commit…); "" gdy brak.
+pub fn tool_meta(root: string, name: string, key: string) -> string is
+    let m: lmanifest::ParseResult = tools::info(layout::at(root), name)
+    if !m.ok is return "" end
+    return lmanifest::get(m.doc, "tool", key, "")
+end
+
+;; ── /packages (magazyn w stylu nix + profile) ───────────────────────────────
+
+;; Instaluje zawartość `content_dir` w store. Wynik: [błąd, nazwa_store].
+pub fn pkg_install(root: string, name: string, version: string, arch: string, nevra: string, source: string,
+                   src_digest: string, deps: [string], content_dir: string) -> [string] is
+    let r: pkgstore::PkgResult = pkgstore::install_dir(layout::at(root),
+        pkgstore::new_spec(name, version, arch, nevra, source, src_digest, deps), content_dir)
+    if !r.ok is return [r.error, ""] end
+    return ["", r.store_name]
+end
+
+;; Nazwa pakietu zapisana w meta.toml wpisu store ("" gdy brak).
+pub fn pkg_name_of(root: string, sname: string) -> string is
+    let m: lmanifest::ParseResult = pkgstore::meta(layout::at(root), sname)
+    if !m.ok is return "" end
+    return lmanifest::get(m.doc, "package", "name", "")
+end
+
+pub fn profile_roots(root: string) -> [string] is return pkgstore::current_roots(layout::at(root)) end
+pub fn profile_generation(root: string) -> int is return pkgstore::current_generation(layout::at(root)) end
+pub fn profile_generations(root: string) -> [int] is return pkgstore::list_generations(layout::at(root)) end
+
+;; Nowa generacja profilu. Wynik: [błąd, generacja, konflikt1, konflikt2…].
+pub fn profile_build(root: string, roots: [string], note: string) -> [string] is
+    let r: pkgstore::ProfileResult = pkgstore::profile_build(layout::at(root), roots, note)
+    if !r.ok is return [r.error, "0"] end
+    let mut out: [string] = ["", text::istr(r.generation)]
+    let mut i: int = 0
+    while i < r.conflicts.len() is
+        out.push(r.conflicts[i])
+        i += 1
+    end
+    return out
+end
+
+;; Cofnięcie profilu. Wynik: [błąd, generacja].
+pub fn profile_rollback(root: string) -> [string] is
+    let r: pkgstore::ProfileResult = pkgstore::profile_rollback(layout::at(root))
+    if !r.ok is return [r.error, "0"] end
+    return ["", text::istr(r.generation)]
+end
+
+pub fn profile_prune(root: string, keep: int) -> int is return pkgstore::profile_prune(layout::at(root), keep) end
+
+;; GC magazynu. Wynik: [błąd, zachowane, usunięte].
+pub fn pkg_gc(root: string, dry_run: bool) -> [string] is
+    let r: pkgstore::PkgGcResult = pkgstore::gc(layout::at(root), dry_run)
+    if !r.ok is return [r.error, "0", "0"] end
+    return ["", text::istr(r.kept), text::istr(r.removed.len())]
+end
+
+;; ── manifest.toml działającego systemu (status/doctor) ──────────────────────
+
+;; Pole z manifestu systemu (<root>/manifest.toml); "" gdy brak.
+pub fn system_manifest_get(root: string, section: string, key: string) -> string is
+    let m: lmanifest::ParseResult = lmanifest::load(layout::at(root).manifest)
+    if !m.ok is return "" end
+    return lmanifest::get(m.doc, section, key, "")
+end
+pub fn system_manifest_layers(root: string) -> int is
+    let m: lmanifest::ParseResult = lmanifest::load(layout::at(root).manifest)
+    if !m.ok is return 0 end
+    return lmanifest::table_sections(m.doc, "layer").len()
+end
+;; Problemy walidacji manifestu ("manifest.toml: …" gdy nie da się wczytać).
+pub fn system_manifest_check(root: string) -> [string] is
+    let m: lmanifest::ParseResult = lmanifest::load(layout::at(root).manifest)
+    if !m.ok is return [m.error] end
+    return lmanifest::validate_manifest(m.doc)
+end
+pub fn pending_tag(root: string) -> string is return deployment::pending_tag(layout::at(root)) end
+pub fn tool_count(root: string) -> int is return tools::list(layout::at(root)).len() end
+pub fn lpm_journal_dir(root: string) -> string is return layout::lpm_journal(layout::at(root)) end
+pub fn path_deployments(root: string) -> string is return layout::deployments_dir(layout::at(root)) end

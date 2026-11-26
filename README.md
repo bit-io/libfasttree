@@ -4,6 +4,9 @@ Następca OSTree: content-addressable, zorientowany blokowo, bez hardlinków.
 **Cała biblioteka i CLI są napisane w H#.** Dla innych języków jest stabilne
 C ABI (`ft_*`).
 
+> **0.6.0:** FastTree jest używany jako **biblioteka** (`use "bit -> libfasttree" from "ft"`) przez lpm, lepm i
+> LegendaryOS-Builder — przez fasadę `ft::api::*` (`src/api.h#`). Zob. `docs/USING-AS-LIBRARY.md`.
+
 ## Dlaczego nie OSTree
 
 | Cecha | OSTree | FastTree |
@@ -21,6 +24,7 @@ C ABI (`ft_*`).
 ```
 Bit.hk                  manifest pakietu (bit): lib + CLI, komendy build-lib/test-all/fsck
 src/lib.h#              wejście biblioteki (zbiera moduły)
+src/api.h#              fasada dla H# (typy proste) — lpm/lepm/builder (0.6)
 src/main.h#             binarka `fasttree`
 src/blake3.h#           BLAKE3 w czystym H# (zweryfikowany względem referencji)
 src/hashing.h#          hashe jako hex, algorytm (blake3 | sha256-fallback)

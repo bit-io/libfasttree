@@ -21,7 +21,10 @@ mod layout
 mod lmanifest
 mod pkgstore
 mod tools
+mod toolfetch
+mod toolbox
 mod deployment
+mod api
 mod lcli
 mod cli
 mod ft

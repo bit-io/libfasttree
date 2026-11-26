@@ -1,0 +1,560 @@
+mod text
+mod sys
+mod hk
+use "std -> fs" from "fs"
+
+;; ═══════════════════════════════════════════════════════════════════════════
+;;  toolfetch — pobieranie gotowych binarek narzędzi (GitHub Releases) do /tools.
+;;
+;;  Wspólny kod buildera (przy budowie obrazu) i lpm (`lpm tools update`). Wersje NIE są wpisane
+;;  na sztywno — katalog narzędzi (tools.hk) mówi, skąd je wziąć:
+;;
+;;    manifest:<Klucz>      wersja z manifest.hk projektu HackerOS ([tools] -> "Hacker Launcher" => v1.0)
+;;    bithk                 wersja z Bit.hk repozytorium narzędzia ([package] -> version => 0.2.0)
+;;    bithk:<owner/repo>    j.w., z innego repozytorium
+;;    latest                najnowsze wydanie (GitHub: releases/latest/download)
+;;    pin:<wersja>          stała wersja
+;;
+;;  Adres:  https://github.com/<repo>/releases/download/<tag>/<asset>
+;;  Tag:    dla "0.2.0" próbujemy "v0.2.0" i "0.2.0"; dla "v0.3" — "v0.3" i "0.3".
+;;  Jeśli wersji nie da się ustalić (brak w manifest.hk, pusty Bit.hk) albo żaden tag nie istnieje,
+;;  a wpis ma `fallback => latest` (domyślnie), pobieramy najnowsze wydanie i zgłaszamy ostrzeżenie.
+;;
+;;  Katalog narzędzi (tools.hk):
+;;    [sources]
+;;    -> manifest_url => https://raw.githubusercontent.com/HackerOS-Linux-System/HackerOS/main/packages/manifest.hk
+;;    -> bithk_url    => https://raw.githubusercontent.com/{repo}/main/Bit.hk
+;;    -> release_url  => https://github.com/{repo}/releases/download/{tag}/{asset}
+;;    -> latest_url   => https://github.com/{repo}/releases/latest/download/{asset}
+;;    [tools]
+;;    -> bit
+;;    --> repo     => HackerOS-Linux-System/bit
+;;    --> asset    => bit               ;; nazwa pliku w wydaniu
+;;    --> as       => bit               ;; nazwa w /tools/bin (domyślnie = asset)
+;;    --> version  => manifest:bit
+;;    --> kind     => cli | desktop | installer | session
+;;    --> title    => Nazwa w menu       ;; dla kind=desktop (plik .desktop)
+;;    --> required => true | false
+;;    --> system   => true | false       ;; dodatkowa kopia w /system/bin (potrzebna zanim /tools się zamontuje)
+;;    --> editions => [all]              ;; albo lista id edycji
+;;    --> sha256   => ...                ;; opcjonalne przypięcie sumy
+;;
+;;  Typy proste na granicy biblioteki (zob. docs/USING-AS-LIBRARY.md): wyniki to [string] wierszy TSV.
+;; ═══════════════════════════════════════════════════════════════════════════
+
+fn tab() -> string is return __builtin_char_code_to_str(9) end
+
+pub fn default_manifest_url() -> string is
+    return "https://raw.githubusercontent.com/HackerOS-Linux-System/HackerOS/main/packages/manifest.hk"
+end
+;; Znaczniki w szablonach URL to {repo} {tag} {asset}; w kodzie H# nawiasy klamrowe w napisach oznaczają
+;; interpolację, więc znacznik budujemy z lbrace()/rbrace().
+pub fn ph(name: string) -> string is return text::lbrace() + name + text::rbrace() end
+pub fn default_bithk_url() -> string is return "https://raw.githubusercontent.com/" + ph("repo") + "/main/Bit.hk" end
+pub fn default_release_url() -> string is return "https://github.com/" + ph("repo") + "/releases/download/" + ph("tag") + "/" + ph("asset") end
+pub fn default_latest_url() -> string is return "https://github.com/" + ph("repo") + "/releases/latest/download/" + ph("asset") end
+
+;; ── Czysta logika (testowana bez sieci) ─────────────────────────────────────
+
+fn unquote(s: string) -> string is
+    let t: string = text::trim(s)
+    let n: int = t.len()
+    if n >= 2 is
+        let q: string = __builtin_char_code_to_str(34)
+        if t[0..1] == q && t[n - 1..n] == q is return t[1..n - 1] end
+    end
+    return t
+end
+
+fn lower_ascii(s: string) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < s.len() is
+        let c: string = s[i..i + 1]
+        if c >= "A" && c <= "Z" is
+            out = out + __builtin_char_code_to_str(__builtin_str_to_char_code(c) + 32)
+        else is
+            out = out + c
+        end
+        i += 1
+    end
+    return out
+end
+
+;; Normalizacja klucza do porównań: małe litery, bez spacji, '-', '_'. "Hacker Launcher" == "hacker_launcher".
+pub fn norm_key(s: string) -> string is
+    let l: string = lower_ascii(unquote(s))
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < l.len() is
+        let c: string = l[i..i + 1]
+        if c != " " && c != "-" && c != "_" is out = out + c end
+        i += 1
+    end
+    return out
+end
+
+;; Wersja z manifest.hk: wiersz `-> Klucz => wartość` w sekcji [tools]; klucz może być w cudzysłowie.
+;; "" gdy klucza nie ma. Porównanie bez rozróżniania wielkości liter i spacji/-/_ .
+pub fn manifest_version(src: string, key: string) -> string is
+    let want: string = norm_key(key)
+    let ls: [string] = text::lines(src)
+    let mut section: string = ""
+    let mut i: int = 0
+    while i < ls.len() is
+        let line: string = text::trim(ls[i])
+        i += 1
+        if line == "" || text::starts_with(line, "!") is
+            ;; komentarz
+        else is
+            if text::starts_with(line, "[") && text::ends_with(line, "]") is
+                section = text::trim(line[1..line.len() - 1])
+            else is
+                if section == "tools" && text::starts_with(line, "->") && !text::starts_with(line, "-->") is
+                    let body: string = text::trim(line[2..line.len()])
+                    let a: int = text::find(body, "=>")
+                    if a >= 0 is
+                        let k: string = body[0..a]
+                        if norm_key(k) == want is return unquote(body[a + 2..body.len()]) end
+                    end
+                end
+            end
+        end
+    end
+    return ""
+end
+
+;; Wersja z Bit.hk: [package] -> version => X. "" gdy brak (np. pusty plik).
+pub fn bithk_version(src: string) -> string is
+    let ls: [string] = text::lines(src)
+    let mut section: string = ""
+    let mut i: int = 0
+    while i < ls.len() is
+        let line: string = text::trim(ls[i])
+        i += 1
+        if line == "" || text::starts_with(line, "!") is
+            ;; komentarz
+        else is
+            if text::starts_with(line, "[") && text::ends_with(line, "]") is
+                section = text::trim(line[1..line.len() - 1])
+            else is
+                if section == "package" && text::starts_with(line, "->") && !text::starts_with(line, "-->") is
+                    let body: string = text::trim(line[2..line.len()])
+                    let a: int = text::find(body, "=>")
+                    if a >= 0 && text::trim(body[0..a]) == "version" is return unquote(body[a + 2..body.len()]) end
+                end
+            end
+        end
+    end
+    return ""
+end
+
+;; Czy wersja jest „zwykłą” wersją (cyfry/litery/./-/_/+), bez znaków mogących zepsuć URL lub powłokę.
+pub fn safe_token(s: string) -> bool is
+    let n: int = s.len()
+    if n == 0 || n > 80 is return false end
+    let mut i: int = 0
+    while i < n is
+        let c: string = s[i..i + 1]
+        let ok: bool = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || c == "." || c == "_" || c == "-" || c == "+"
+        if !ok is return false end
+        i += 1
+    end
+    return true
+end
+
+;; Nazwa pliku w /tools/bin: j.w. plus '#' (np. "h#").
+pub fn safe_name(s: string) -> bool is
+    if s == "#" is return false end
+    return safe_token(text::join(text::split(s, "#"), "x"))
+end
+
+pub fn safe_repo(s: string) -> bool is
+    let parts: [string] = text::split(s, "/")
+    if parts.len() != 2 is return false end
+    return safe_token(parts[0]) && safe_token(parts[1])
+end
+
+;; Kandydaci tagów GitHub dla wersji: "v0.3" -> [v0.3, 0.3]; "0.2.0" -> [v0.2.0, 0.2.0]; "snapshot-x" -> [snapshot-x].
+pub fn tag_candidates(ver: string) -> [string] is
+    let mut out: [string] = []
+    if ver == "" is return out end
+    let first: string = ver[0..1]
+    let is_digit: bool = first >= "0" && first <= "9"
+    if text::starts_with(ver, "v") && ver.len() > 1 && ver[1..2] >= "0" && ver[1..2] <= "9" is
+        out.push(ver)
+        out.push(ver[1..ver.len()])
+    else is
+        if is_digit is
+            out.push("v" + ver)
+            out.push(ver)
+        else is
+            out.push(ver)
+        end
+    end
+    return out
+end
+
+pub fn fill(tpl: string, repo: string, tag: string, asset: string) -> string is
+    let a: string = text::join(text::split(tpl, ph("repo")), repo)
+    let b: string = text::join(text::split(a, ph("tag")), tag)
+    return text::join(text::split(b, ph("asset")), asset)
+end
+
+;; Pierwsze bajty pliku (hex) wskazują ELF albo skrypt `#!`. Odrzuca stronę HTML / pusty plik / błąd 404.
+pub fn looks_executable(head_hex: string) -> bool is
+    let h: string = text::trim(head_hex)
+    return text::starts_with(h, "7f454c46") || text::starts_with(h, "2321")
+end
+
+;; ── Wpisy katalogu ──────────────────────────────────────────────────────────
+
+pub struct Entry is
+    pub id:       string
+    pub repo:     string
+    pub asset:    string
+    pub as_name:  string
+    pub version:  string   ;; specyfikacja (manifest:… / bithk / latest / pin:…)
+    pub kind:     string
+    pub title:    string
+    pub required: bool
+    pub system:   bool
+    pub editions: [string]
+    pub sha256:   string
+    pub fallback: bool
+end
+
+;; Identyfikatory narzędzi z katalogu (klucze "<id>.repo").
+pub fn catalog_ids(path: string) -> [string] is
+    let mut out: [string] = []
+    let ks: [string] = hk::keys(hk::load(path).doc, "tools")
+    let mut i: int = 0
+    while i < ks.len() is
+        let k: string = ks[i]
+        i += 1
+        if text::ends_with(k, ".repo") is out.push(k[0..k.len() - 5]) end
+    end
+    return out
+end
+
+pub fn load_entry(path: string, id: string) -> Entry is
+    let d: hk::Doc = hk::load(path).doc
+    let asset: string = hk::get(d, "tools", id + ".asset", id)
+    return Entry { id: id, repo: hk::get(d, "tools", id + ".repo", ""), asset: asset,
+        as_name: hk::get(d, "tools", id + ".as", asset),
+        version: hk::get(d, "tools", id + ".version", "latest"),
+        kind: hk::get(d, "tools", id + ".kind", "cli"),
+        title: hk::get(d, "tools", id + ".title", id),
+        required: hk::get_bool(d, "tools", id + ".required", true),
+        system: hk::get_bool(d, "tools", id + ".system", false),
+        editions: hk::get_list(d, "tools", id + ".editions"),
+        sha256: hk::get(d, "tools", id + ".sha256", ""),
+        fallback: hk::get(d, "tools", id + ".fallback", "latest") == "latest" }
+end
+
+pub fn in_edition(e: Entry, edition: string) -> bool is
+    if e.editions.len() == 0 is return true end
+    let mut i: int = 0
+    while i < e.editions.len() is
+        if e.editions[i] == "all" || e.editions[i] == edition is return true end
+        i += 1
+    end
+    return false
+end
+
+;; Problemy katalogu (puste = OK): brakujące pola, niebezpieczne znaki, duplikaty nazw w /tools/bin.
+pub fn validate_catalog(path: string) -> [string] is
+    let mut probs: [string] = []
+    let ce: string = hk::load(path).error
+    if ce != "" is
+        probs.push(ce)
+        return probs
+    end
+    let ids: [string] = catalog_ids(path)
+    if ids.len() == 0 is probs.push("katalog narzędzi nie ma żadnego wpisu [tools] -> <id> --> repo") end
+    let mut seen: [string] = []
+    let mut i: int = 0
+    while i < ids.len() is
+        let e: Entry = load_entry(path, ids[i])
+        i += 1
+        if !safe_token(e.id) is probs.push("niepoprawny id narzędzia: '" + e.id + "'") end
+        if !safe_repo(e.repo) is probs.push(e.id + ": repo musi mieć postać owner/repo (jest '" + e.repo + "')") end
+        if !safe_token(e.asset) is probs.push(e.id + ": niepoprawny asset '" + e.asset + "'") end
+        if !safe_name(e.as_name) is probs.push(e.id + ": niepoprawna nazwa 'as' '" + e.as_name + "'") end
+        if e.kind != "cli" && e.kind != "desktop" && e.kind != "installer" && e.kind != "session" is
+            probs.push(e.id + ": kind: cli | desktop | installer | session")
+        end
+        let mut d: int = 0
+        while d < seen.len() is
+            if seen[d] == e.as_name is probs.push(e.id + ": nazwa '" + e.as_name + "' jest już użyta przez inne narzędzie") end
+            d += 1
+        end
+        seen.push(e.as_name)
+    end
+    return probs
+end
+
+;; ── Sieć ────────────────────────────────────────────────────────────────────
+
+fn curl_opts() -> string is
+    return "-fsSL --retry 3 --retry-delay 2 --retry-connrefused --connect-timeout 20 --max-time 900 "
+end
+
+;; Pobiera url do pliku (atomowo: .part -> rename). "" albo błąd (końcówka wyjścia curl).
+pub fn download(url: string, dest: string) -> string is
+    sys::mkdir_p(text::dirname(dest))
+    let part: string = dest + ".part"
+    sys::rm_f(part)
+    let r: sys::Exec = sys::exec("curl " + curl_opts() + "-o " + sys::sq(part) + " " + sys::sq(url))
+    if r.code != 0 is
+        sys::rm_f(part)
+        let o: string = text::trim(r.out)
+        if o == "" is return "curl zakończył się kodem " + text::istr(r.code) end
+        return o
+    end
+    if !fs::exists(part) is return "pobranie nie utworzyło pliku" end
+    let mv: sys::Exec = sys::exec("mv -f -- " + sys::sq(part) + " " + sys::sq(dest))
+    if mv.code != 0 is return "nie można zapisać " + dest end
+    return ""
+end
+
+fn head_hex(path: string) -> string is
+    let r: sys::Exec = sys::exec("head -c 4 " + sys::sq(path) + " | od -An -tx1 | tr -d ' \\n'")
+    return text::trim(r.out)
+end
+
+pub fn sha256_of(path: string) -> string is
+    let r: sys::Exec = sys::exec("sha256sum " + sys::sq(path))
+    if r.code != 0 is return "" end
+    return text::split(text::trim(r.out), " ")[0]
+end
+
+fn valid_binary(path: string) -> string is
+    if !fs::exists(path) is return "brak pliku" end
+    if fs::size(path) < 64 is return "plik jest pusty albo zbyt mały (" + text::istr(fs::size(path)) + " B)" end
+    if !looks_executable(head_hex(path)) is return "to nie jest plik wykonywalny (ELF ani skrypt #!) — to pewnie strona błędu" end
+    return ""
+end
+
+;; Cache tekstu zdalnego (manifest.hk, Bit.hk): zwraca treść albo "" (z błędem w `err`).
+pub struct Text is
+    pub ok:   bool
+    pub body: string
+    pub err:  string
+end
+
+fn fetch_text(url: string, cache_file: string) -> Text is
+    let e: string = download(url, cache_file)
+    if e != "" is return Text { ok: false, body: "", err: e } end
+    return Text { ok: true, body: fs::read(cache_file), err: "" }
+end
+
+pub struct Resolved is
+    pub version: string   ;; wersja logiczna ("" = nieznana)
+    pub note:    string   ;; ostrzeżenie/wyjaśnienie ("" = brak)
+end
+
+;; Ustala wersję według specyfikacji. `manifest_body` to treść manifest.hk ("" = niedostępny).
+pub fn resolve_version(e: Entry, manifest_body: string, bithk_tpl: string, cache: string) -> Resolved is
+    let spec: string = e.version
+    if spec == "latest" || spec == "" is return Resolved { version: "", note: "" } end
+    if text::starts_with(spec, "pin:") is return Resolved { version: spec[4..spec.len()], note: "" } end
+    if text::starts_with(spec, "manifest:") is
+        if manifest_body == "" is return Resolved { version: "", note: "manifest.hk niedostępny" } end
+        let v: string = manifest_version(manifest_body, spec[9..spec.len()])
+        if v == "" is return Resolved { version: "", note: "brak '" + spec[9..spec.len()] + "' w manifest.hk" } end
+        return Resolved { version: v, note: "" }
+    end
+    if spec == "bithk" || text::starts_with(spec, "bithk:") is
+        let mut repo: string = e.repo
+        if text::starts_with(spec, "bithk:") is repo = spec[6..spec.len()] end
+        if !safe_repo(repo) is return Resolved { version: "", note: "niepoprawne repo dla bithk: " + repo } end
+        let url: string = fill(bithk_tpl, repo, "", "")
+        let t: Text = fetch_text(url, text::path_join(text::path_join(cache, "meta"), text::join(text::split(repo, "/"), "__") + ".Bit.hk"))
+        if !t.ok is return Resolved { version: "", note: "Bit.hk niedostępny (" + t.err + ")" } end
+        let v: string = bithk_version(t.body)
+        if v == "" is return Resolved { version: "", note: "Bit.hk repozytorium " + repo + " nie ma [package] version" } end
+        return Resolved { version: v, note: "" }
+    end
+    if safe_token(spec) is return Resolved { version: spec, note: "" } end
+    return Resolved { version: "", note: "niepoprawna specyfikacja wersji: " + spec }
+end
+
+;; ── Pobranie jednego narzędzia ──────────────────────────────────────────────
+
+;; Wynik: pola TSV: status(OK|WARN|ERR), id, as, wersja, bajty, sha256, źródło, system, kind, ścieżka_pliku, komunikat
+fn row(status: string, e: Entry, version: string, nbytes: int, sha: string, source: string, file: string, msg: string) -> string is
+    let t: string = tab()
+    let mut sys_flag: string = "0"
+    if e.system is sys_flag = "1" end
+    return status + t + e.id + t + e.as_name + t + version + t + text::istr(nbytes) + t + sha + t + source + t + sys_flag + t + e.kind + t + file + t + msg
+end
+
+fn finish(e: Entry, version: string, file: string, source: string, note: string) -> string is
+    let bad: string = valid_binary(file)
+    if bad != "" is
+        sys::rm_f(file)
+        return row("ERR", e, version, 0, "", source, "", bad)
+    end
+    let sha: string = sha256_of(file)
+    if e.sha256 != "" && e.sha256 != sha is
+        sys::rm_f(file)
+        return row("ERR", e, version, 0, sha, source, "", "suma sha256 nie zgadza się z przypiętą w katalogu (jest " + sha + ")")
+    end
+    let ch: sys::Exec = sys::exec("chmod 0755 " + sys::sq(file))
+    let mut status: string = "OK"
+    if note != "" is status = "WARN" end
+    return row(status, e, version, fs::size(file), sha, source, file, note)
+end
+
+;; Pobiera narzędzie do <cache>/tools/<id>/<tag>/<asset>. `local_dir` ("" = brak): jeśli zawiera plik <as> lub <asset>,
+;; jest użyty zamiast pobrania (budowy offline / wydania jeszcze niepublikowane). `offline`: tylko cache/local.
+pub fn fetch_one(e: Entry, manifest_body: string, cache: string, local_dir: string, offline: bool,
+                 release_tpl: string, latest_tpl: string, bithk_tpl: string) -> string is
+    if local_dir != "" is
+        let cands: [string] = [text::path_join(local_dir, e.as_name), text::path_join(local_dir, e.asset)]
+        let mut c: int = 0
+        while c < cands.len() is
+            if fs::exists(cands[c]) is
+                let dst: string = text::path_join(text::path_join(text::path_join(cache, "tools"), e.id), "local/" + e.asset)
+                sys::mkdir_p(text::dirname(dst))
+                let cp: sys::Exec = sys::exec("cp -f -- " + sys::sq(cands[c]) + " " + sys::sq(dst))
+                if cp.code != 0 is return row("ERR", e, "local", 0, "", "local", "", "kopiowanie z " + cands[c] + " nie powiodło się") end
+                return finish(e, "local", dst, "local:" + cands[c], "")
+            end
+            c += 1
+        end
+    end
+    if !safe_repo(e.repo) || !safe_token(e.asset) is
+        return row("ERR", e, "", 0, "", "", "", "niepoprawne repo/asset w katalogu")
+    end
+    let r: Resolved = resolve_version(e, manifest_body, bithk_tpl, cache)
+    let base: string = text::path_join(text::path_join(cache, "tools"), e.id)
+    let mut note: string = r.note
+    if r.version != "" is
+        let tags: [string] = tag_candidates(r.version)
+        let mut t: int = 0
+        let mut last_err: string = ""
+        while t < tags.len() is
+            if !safe_token(tags[t]) is
+                last_err = "niebezpieczny tag: " + tags[t]
+            else is
+                let dst: string = text::path_join(text::path_join(base, tags[t]), e.asset)
+                let url: string = fill(release_tpl, e.repo, tags[t], e.asset)
+                if fs::exists(dst) && valid_binary(dst) == "" is
+                    return finish(e, r.version, dst, "cache:" + tags[t], "")
+                end
+                if offline is
+                    last_err = "tryb offline: brak w cache " + dst
+                else is
+                    let de: string = download(url, dst)
+                    if de == "" is return finish(e, r.version, dst, url, "") end
+                    last_err = de
+                end
+            end
+            t += 1
+        end
+        note = "wydanie " + r.version + " niedostępne (" + last_err + ")"
+    end
+    ;; wersji nie ustalono albo tag nie istnieje
+    if r.version == "" && e.version != "latest" && e.version != "" is
+        if note == "" is note = "nie ustalono wersji" end
+    end
+    if e.version != "latest" && e.version != "" && !e.fallback is
+        return row("ERR", e, r.version, 0, "", "", "", note + " (fallback wyłączony)")
+    end
+    if offline is return row("ERR", e, "", 0, "", "", "", "tryb offline: brak lokalnej binarki dla " + e.id) end
+    let dst2: string = text::path_join(text::path_join(base, "latest"), e.asset)
+    let url2: string = fill(latest_tpl, e.repo, "", e.asset)
+    let de2: string = download(url2, dst2)
+    if de2 != "" is
+        let m: string = "brak wydania: " + de2
+        if note != "" is return row("ERR", e, "", 0, "", url2, "", note + "; " + m) end
+        return row("ERR", e, "", 0, "", url2, "", m)
+    end
+    let mut why: string = note
+    if why == "" is why = "użyto najnowszego wydania (wersja nie jest przypięta)" else is why = why + " — użyto najnowszego wydania" end
+    if e.version == "latest" || e.version == "" is why = "" end
+    return finish(e, "latest", dst2, url2, why)
+end
+
+;; ── Cały katalog dla edycji ─────────────────────────────────────────────────
+
+;; Pobiera wszystkie narzędzia edycji `edition` (puste "" = wszystkie wpisy), pomijając `exclude`.
+;; Wiersze: jak `row` (TSV). Pierwszy wiersz: "#manifest<TAB>źródło<TAB>ostrzeżenie".
+pub fn fetch_catalog(catalog: string, edition: string, exclude: [string], cache: string, local_dir: string, offline: bool) -> [string] is
+    let t: string = tab()
+    let mut out: [string] = []
+    let probs: [string] = validate_catalog(catalog)
+    if probs.len() > 0 is
+        out.push("ERR" + t + "-" + t + "-" + t + "" + t + "0" + t + "" + t + "" + t + "0" + t + "" + t + "" + t + "katalog: " + probs[0])
+        return out
+    end
+    let d: hk::Doc = hk::load(catalog).doc
+    let mf_url: string = hk::get(d, "sources", "manifest_url", default_manifest_url())
+    let rel: string = hk::get(d, "sources", "release_url", default_release_url())
+    let lat: string = hk::get(d, "sources", "latest_url", default_latest_url())
+    let bit: string = hk::get(d, "sources", "bithk_url", default_bithk_url())
+    let mut manifest_body: string = ""
+    let mut mnote: string = ""
+    let env_local: string = sys::getenv_or("LEGENDARY_MANIFEST_HK", "")
+    if env_local != "" && fs::exists(env_local) is
+        manifest_body = fs::read(env_local)
+        mnote = ""
+        out.push("#manifest" + t + env_local + t + "")
+    else is
+        if offline is
+            let cf: string = text::path_join(text::path_join(cache, "meta"), "manifest.hk")
+            if fs::exists(cf) is manifest_body = fs::read(cf) end
+            out.push("#manifest" + t + "cache" + t + "")
+        else is
+            let cf2: string = text::path_join(text::path_join(cache, "meta"), "manifest.hk")
+            let m: Text = fetch_text(mf_url, cf2)
+            if m.ok is
+                manifest_body = m.body
+                out.push("#manifest" + t + mf_url + t + "")
+            else is
+                if fs::exists(cf2) is manifest_body = fs::read(cf2) end
+                out.push("#manifest" + t + mf_url + t + "manifest.hk niedostępny (" + m.err + ")" + " — użyto kopii z cache, jeśli jest")
+            end
+        end
+    end
+    let ids: [string] = catalog_ids(catalog)
+    let mut i: int = 0
+    while i < ids.len() is
+        let e: Entry = load_entry(catalog, ids[i])
+        i += 1
+        let mut skip: bool = !in_edition(e, edition)
+        let mut x: int = 0
+        while x < exclude.len() is
+            if exclude[x] == e.id is skip = true end
+            x += 1
+        end
+        if !skip is
+            out.push(fetch_one(e, manifest_body, cache, local_dir, offline, rel, lat, bit))
+        end
+    end
+    return out
+end
+
+;; Wpisy katalogu dla edycji jako wiersze TSV: id, as, kind, required, system, version-spec, repo, title.
+pub fn list_catalog(catalog: string, edition: string, exclude: [string]) -> [string] is
+    let t: string = tab()
+    let mut out: [string] = []
+    let ids: [string] = catalog_ids(catalog)
+    let mut i: int = 0
+    while i < ids.len() is
+        let e: Entry = load_entry(catalog, ids[i])
+        i += 1
+        let mut skip: bool = !in_edition(e, edition)
+        let mut x: int = 0
+        while x < exclude.len() is
+            if exclude[x] == e.id is skip = true end
+            x += 1
+        end
+        if !skip is
+            out.push(e.id + t + e.as_name + t + e.kind + t + text::bstr(e.required) + t + text::bstr(e.system) + t + e.version + t + e.repo + t + e.title)
+        end
+    end
+    return out
+end

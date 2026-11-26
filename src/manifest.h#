@@ -106,7 +106,7 @@ end
 
 ;; Przechodzi po `source_dir`, dzieli pliki na chunki (FastCDC), zapisuje je
 ;; do `s` (automatyczny dedup) i buduje manifest.
-pub fn build(source_dir: string, s: store::Store, cfg: chunker::ChunkerConfig) -> BuildResult is
+pub fn build_cfg(source_dir: string, s: store::Store, cfg: chunker::ChunkerConfig) -> BuildResult is
     let tr: sys::TreeResult = sys::list_tree(source_dir)
     if !tr.ok is return fail_build(tr.error) end
     let mut entries: [FileEntry] = []
@@ -151,7 +151,7 @@ pub fn build(source_dir: string, s: store::Store, cfg: chunker::ChunkerConfig) -
 end
 
 pub fn build_default(source_dir: string, s: store::Store) -> BuildResult is
-    return build(source_dir, s, chunker::default_config())
+    return build_cfg(source_dir, s, chunker::default_config())
 end
 
 ;; ── JSON ─────────────────────────────────────────────────────────────────────

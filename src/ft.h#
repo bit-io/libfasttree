@@ -229,7 +229,7 @@ end
 pub fn manifest_build(source_dir: string, store_root: string, min_size: int, avg_size: int, max_size: int) -> string is
     let o: store::OpenResult = store::open(store_root)
     if !o.ok is return fail(o.error) end
-    let b: manifest::BuildResult = manifest::build(source_dir, o.store, cfg_of(min_size, avg_size, max_size))
+    let b: manifest::BuildResult = manifest::build_cfg(source_dir, o.store, cfg_of(min_size, avg_size, max_size))
     if !b.ok is return fail(b.error) end
     let env: json::J = env_ok()
     json::set(env, "manifest", manifest::to_json_value(b.manifest))

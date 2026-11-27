@@ -94,8 +94,25 @@ pub fn read_text(path: string) -> string is
     return fs::read(path)
 end
 
+;; Zapis ATOMOWY (plik tymczasowy + rename) z weryfikacją rozmiaru. Wynik
+;; `fs::write` jest celowo ignorowany: w różnych wersjach stdlib H# zwraca
+;; `bool` albo `void` (stąd dawny błąd "return type mismatch in sys_write_text"),
+;; więc o sukcesie decyduje sprawdzenie na dysku, nie typ zwracany.
 pub fn write_text(path: string, content: string) -> bool is
-    return fs::write(path, content)
+    let tmp: string = path + ".tmp." + text::istr(os::pid())
+    fs::write(tmp, content)
+    if !fs::exists(tmp) is return false end
+    let want: int = string_to_bytes(content).len()
+    if fs::size(tmp) != want is
+        rm_f(tmp)
+        return false
+    end
+    fs::rename(tmp, path)
+    if fs::exists(tmp) is
+        rm_f(tmp)
+        return false
+    end
+    return fs::exists(path)
 end
 
 pub fn tmp_dir() -> string is

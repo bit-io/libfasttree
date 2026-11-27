@@ -1,0 +1,66 @@
+use "std -> test" from "test"
+use "std -> fs" from "fs"
+mod check
+mod text
+mod sys
+mod hashing
+mod blake3
+mod store
+mod manifest
+mod composefs
+
+;; Testy utwardzenia 0.8: ścieżki, zapis atomowy, wektory BLAKE3 po optymalizacji.
+
+fn fresh(name: string) -> string is
+    let root: string = text::path_join(sys::tmp_dir(), "fasttree-h-hard-" + name + "-" + text::istr(sys::pid()))
+    sys::rm_rf(root)
+    return root
+end
+
+#[test]
+fn safe_rel_path_rules() is
+    test::assert_true(text::safe_rel_path("usr/bin/ls"))
+    test::assert_true(text::safe_rel_path("a..b/c"))
+    test::assert_false(text::safe_rel_path(""))
+    test::assert_false(text::safe_rel_path("/etc/passwd"))
+    test::assert_false(text::safe_rel_path("../x"))
+    test::assert_false(text::safe_rel_path("a/../../x"))
+    test::assert_false(text::safe_rel_path("a/b/.."))
+end
+
+#[test]
+fn write_text_is_atomic_and_leaves_no_tmp() is
+    let root: string = fresh("wt")
+    fs::mkdir(root)
+    let p: string = text::path_join(root, "CURRENT_TAG")
+    test::assert_true(sys::write_text(p, "v1"))
+    check::eq(fs::read(p), "v1")
+    test::assert_true(sys::write_text(p, "wersja-2-zażółć"))
+    check::eq(fs::read(p), "wersja-2-zażółć")
+    let tr: sys::TreeResult = sys::list_tree(root)
+    test::assert_true(tr.ok)
+    check::eq(text::istr(tr.entries.len()), "1")
+    test::assert_false(sys::write_text(text::path_join(root, "brak/podkatalogu/x"), "z"))
+    sys::rm_rf(root)
+end
+
+#[test]
+fn blake3_known_vector_after_unrolled_compress() is
+    ;; BLAKE3("abc") — wektor referencyjny
+    check::eq(hashing::hex_of(blake3::hash([97, 98, 99])), "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85")
+end
+
+#[test]
+fn materialize_rejects_path_traversal() is
+    let root: string = fresh("trav")
+    let o: store::OpenResult = store::open(text::path_join(root, "store"))
+    test::assert_true(o.ok)
+    let bad: manifest::FileEntry = manifest::FileEntry { path: "../evil", mode: "directory", size: 0, chunks: [], link_target: "" }
+    let m: manifest::Manifest = manifest::Manifest {
+        format_version: manifest::format_version(), hash_algo: hashing::algo_name(),
+        min_size: 4096, avg_size: 16384, max_size: 65536, root: "x", entries: [bad] }
+    let r: composefs::CfsResult = composefs::materialize_tree(m, o.store, text::path_join(root, "out"))
+    test::assert_false(r.ok)
+    test::assert_false(fs::exists(text::path_join(root, "evil")))
+    sys::rm_rf(root)
+end

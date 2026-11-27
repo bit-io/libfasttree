@@ -223,7 +223,7 @@ pub fn derive(root: string, base_tag: string, changes_dir: string, new_tag: stri
         sys::rm_rf(work)
         return dfail(br.error)
     end
-    if !fs::write(new_path, manifest::to_json(br.manifest)) is
+    if !sys::write_text(new_path, manifest::to_json(br.manifest)) is
         sys::rm_rf(work)
         return dfail("nie można zapisać " + new_path)
     end

@@ -45,7 +45,7 @@ src/composefs.h#        obraz composefs + mount + dm-verity
 src/overlay.h#          OverlayFS (ulotny tmpfs / trwały)
 src/cli.h#              komendy CLI
 src/ft.h#               STABILNE C ABI (symbole ft_*) — jedyna powierzchnia FFI
-src/tests/*_test.h#     72 testy jednostkowe H#
+src/tests/*_test.h#     75 testów jednostkowych H#
 scripts/                build-lib.sh, run-tests.sh
 ```
 
@@ -140,7 +140,7 @@ Zweryfikowane przez uruchomienie (kompilator h# 0.9.0, Linux x86_64):
 * Pełny `pull` z fikcyjnego rejestru z **Bearer auth**, whiteoutem, opaque
   whiteoutem, hardlinkiem, symlinkiem i bitem wykonania; rekonstrukcja plików
   ze store bajt w bajt; `pin`, `gc` (usuwanie sierot, abort przy braku manifestu).
-* 72 testy H# w 14 plikach (`scripts/run-tests.sh`): fsck, repo, stats, ABI, CLI end-to-end, derive, utwardzenie (0.8).
+* 75 testów H# w 15 plikach (w tym layout_test: /temp -> /state/var/tmp) (`scripts/run-tests.sh`): fsck, repo, stats, ABI, CLI end-to-end, derive, utwardzenie (0.8).
 * 0.3: pełny przepływ CLI (snapshot, diff, checkout, fsck z uszkodzeniem i `--repair`, pin/rm/rollback) na prawdziwych plikach.
 
 **Nie zweryfikowane** (brak środowiska): symbole C `ft_*` rozszerzeń 0.3 (sprawdzone tylko z poziomu H#; potrzebny backend LLVM — z backendem C++ kompilator eksportuje nazwy zmanglowane), `.github/workflows/ci.yml`, prawdziwe `mkcomposefs`/`mount.composefs`, `overlay commit` na zamontowanym overlayu (logika `derive` jest testowana na katalogach),
@@ -183,3 +183,10 @@ potrafi trafić w złe pole, literały z `{...}` są interpolowane, `.pop()` i
 `std -> strbuf/map` nie mają kodowania w LLVM, `assert_eq` porównuje napisy po
 wskaźniku (stąd `src/tests/check.h#`). Kod unika tych konstrukcji; przy
 aktualizacji kompilatora warto je ponownie sprawdzić.
+
+## Układ: /temp
+
+Obok `/system /state /packages /tools /home` istnieje `/temp` — odpowiednik `/tmp`. To symlink `temp -> state/var/tmp`
+(tworzony przez `layout::apply_compat_links` / `fasttree layout links`, katalog docelowy z `layout::ensure` ma tryb 1777).
+Ścieżka dostępna w kodzie jako `layout::Layout.temp` (symlink) i `layout::temp_dir(l)` (katalog docelowy); manifest
+wdrożenia zapisuje `[layout] temp = "/temp"`. Zmiana jest wyłącznie dodatkiem — dotychczasowe ścieżki bez zmian.

@@ -210,12 +210,12 @@ pub fn stage_build(stage: string, rows: [string], catalog: string, edition: stri
             idx = idx + "-> " + id + "\n--> as => " + as_name + "\n--> version => " + f[3] + "\n--> sha256 => " + f[5] + "\n--> kind => " + f[8] + "\n--> bytes => " + f[4] + "\n--> source => " + f[6] + "\n"
             if f[8] == "desktop" || f[8] == "installer" is
                 let dt: string = "[Desktop Entry]\nType=Application\nName=" + toolfetch::load_entry(catalog, id).title + "\nExec=/tools/bin/" + as_name + "\nTerminal=false\nCategories=System;\nX-LegendaryOS-Tool=" + id + "\n"
-                let w: bool = fs::write(text::path_join(text::path_join(stage, "share/applications"), id + ".desktop"), dt)
+                let w: bool = sys::write_text(text::path_join(text::path_join(stage, "share/applications"), id + ".desktop"), dt)
             end
             n += 1
         end
     end
     if n == 0 is return "żadne narzędzie nie trafiło do obrazu (stage pusty)" end
-    if !fs::write(text::path_join(stage, "TOOLS.hk"), idx) is return "nie można zapisać TOOLS.hk" end
+    if !sys::write_text(text::path_join(stage, "TOOLS.hk"), idx) is return "nie można zapisać TOOLS.hk" end
     return ""
 end

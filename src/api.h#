@@ -37,7 +37,7 @@ mod pkgstore
 ;;      let err: string = ft::api::snapshot(ft_root, rootfs, tag)
 ;; ═══════════════════════════════════════════════════════════════════════════
 
-pub fn version() -> string is return "0.7.0" end
+pub fn version() -> string is return "0.8.0" end
 
 fn tab() -> string is return __builtin_char_code_to_str(9) end
 
@@ -61,7 +61,7 @@ pub fn snapshot(ft_root: string, dir: string, tag: string) -> string is
     let br: manifest::BuildResult = manifest::build_default(dir, so.store)
     if !br.ok is return br.error end
     let mpath: string = manifest::manifest_path_in(ft_root, tag)
-    if !fs::write(mpath, manifest::to_json(br.manifest)) is return "nie można zapisać " + mpath end
+    if !sys::write_text(mpath, manifest::to_json(br.manifest)) is return "nie można zapisać " + mpath end
     return ""
 end
 
@@ -104,7 +104,7 @@ pub fn pull(ft_root: string, image_ref: string, alias: string) -> string is
     let br: manifest::BuildResult = manifest::build_default(merged, so.store)
     if !br.ok is return br.error end
     let mpath: string = manifest::manifest_path_in(ft_root, tag)
-    if !fs::write(mpath, manifest::to_json(br.manifest)) is return "nie można zapisać " + mpath end
+    if !sys::write_text(mpath, manifest::to_json(br.manifest)) is return "nie można zapisać " + mpath end
     sys::rm_rf(work)
     return ""
 end
@@ -123,10 +123,10 @@ pub fn deploy(ft_root: string, tag: string, atomic: bool) -> string is
     let image: string = deploy_dir + ".erofs"
     let br: composefs::CfsResult = composefs::build_image(pr.manifest, so.store, deploy_dir + ".materialized", image)
     if !br.ok is return br.error end
-    if !fs::write(image + ".digest", br.value) is return "nie można zapisać " + image + ".digest" end
+    if !sys::write_text(image + ".digest", br.value) is return "nie można zapisać " + image + ".digest" end
     let v: composefs::DmVerityInfo = composefs::dm_verity_format(image)
     if !v.ok is return v.error end
-    if !fs::write(image + ".veritysum", v.root_hash) is return "nie można zapisać " + image + ".veritysum" end
+    if !sys::write_text(image + ".veritysum", v.root_hash) is return "nie można zapisać " + image + ".veritysum" end
     let link: string = text::path_join(ft_root, "current")
     if atomic is
         let tmp: string = link + ".tmp"
@@ -142,10 +142,10 @@ pub fn deploy(ft_root: string, tag: string, atomic: bool) -> string is
     if fs::exists(cur_f) is
         let prev: string = text::trim(fs::read(cur_f))
         if prev != tag is
-            let w: bool = fs::write(text::path_join(ft_root, "PREVIOUS_TAG"), prev)
+            let w: bool = sys::write_text(text::path_join(ft_root, "PREVIOUS_TAG"), prev)
         end
     end
-    if !fs::write(cur_f, tag) is return "nie można zapisać CURRENT_TAG" end
+    if !sys::write_text(cur_f, tag) is return "nie można zapisać CURRENT_TAG" end
     return ""
 end
 

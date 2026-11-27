@@ -170,7 +170,7 @@ pub fn stage_layered(l: layout::Layout, base_tag: string, changes_dir: string, n
     let re: string = save_record(l, Record { tag: new_tag, parent: base_tag, generation: gen,
         kind: "layered", status: "staged", created: now })
     if re != "" is return sfail(re) end
-    if !fs::write(text::path_join(root, "PENDING_TAG"), new_tag) is return sfail("nie można zapisać PENDING_TAG") end
+    if !sys::write_text(text::path_join(root, "PENDING_TAG"), new_tag) is return sfail("nie można zapisać PENDING_TAG") end
     return StageResult { ok: true, error: "", tag: new_tag, changed: dr.changed, deleted: dr.deleted }
 end
 

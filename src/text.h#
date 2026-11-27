@@ -186,3 +186,23 @@ end
 ;; Nawiasy klamrowe jako napisy — literały `"{...}"` są w H# interpolowane.
 pub fn lbrace() -> string is return __builtin_char_code_to_str(123) end
 pub fn rbrace() -> string is return __builtin_char_code_to_str(125) end
+
+;; Czy `p` jest bezpieczną ścieżką WZGLĘDNĄ (do materializacji manifestu):
+;; niepusta, bez wiodącego '/', bez składowych ".." i bez znaków sterujących.
+;; Chroni `checkout`/`deploy` przed manifestem wychodzącym poza katalog docelowy.
+pub fn safe_rel_path(p: string) -> bool is
+    let n: int = p.len()
+    if n == 0 || n > 4096 is return false end
+    if p[0..1] == "/" is return false end
+    let mut i: int = 0
+    while i < n is
+        let c: int = __builtin_str_to_char_code(p[i..i + 1])
+        if c < 32 || c == 127 is return false end
+        i += 1
+    end
+    let parts: [string] = split(p, "/")
+    for seg in parts is
+        if seg == ".." is return false end
+    end
+    return true
+end

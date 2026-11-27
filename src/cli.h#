@@ -165,7 +165,7 @@ pub fn cmd_pin(tag: string, note: string) -> int is
     json::set(o, "note", json::jstr(note))
     json::set(o, "pinnedAt", json::jstr(text::trim(sys::exec("date -u +%Y-%m-%dT%H:%M:%SZ").out)))
     pins.items.push(o)
-    if !fs::write(pins_path, json::to_pretty(pins)) is return fail("nie można zapisać " + pins_path) end
+    if !sys::write_text(pins_path, json::to_pretty(pins)) is return fail("nie można zapisać " + pins_path) end
     say("[fasttree] przypięto '" + tag + "': " + note)
     return 0
 end
@@ -190,7 +190,7 @@ pub fn cmd_overlay_create(name: string, ephemeral: bool) -> int is
     if !fs::is_dir(base) || !fs::exists(marker) is
         let m: composefs::CfsResult = composefs::mount_image(image, base, "")
         if !m.ok is return fail(m.error) end
-        let w: bool = fs::write(marker, "")
+        let w: bool = sys::write_text(marker, "")
         say("[fasttree] zamontowano bazowy obraz '" + tag + "' (read-only) w " + base)
     end
     let mountpoint: string = text::path_join(text::path_join(root, "overlay-mounts"), name)

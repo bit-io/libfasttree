@@ -15,6 +15,8 @@ use "std -> fs" from "fs"
 ;;   /tools     narzędzia HackerOS / Zenit Linux: git -> squashfs, montowane
 ;;              tylko do odczytu (nic nie jest rozpakowywane przy uruchomieniu).
 ;;   /home      dane użytkowników — jedyny katalog zapisywalny przez użytkownika.
+;;   /temp      pliki tymczasowe (odpowiednik /tmp): symlink do /state/var/tmp
+;;              (tryb 1777, dostępny dla wszystkich użytkowników).
 ;;   /manifest.toml  opis aktywnego wdrożenia (patrz lmanifest.h#).
 ;;
 ;; Kompatybilność: stare ścieżki (/usr, /bin, /lib, /etc, /var ...) są
@@ -31,6 +33,7 @@ pub struct Layout is
     pub packages: string
     pub tools:    string
     pub home:     string
+    pub temp:     string
     pub manifest: string
 end
 
@@ -42,6 +45,7 @@ pub fn at(root: string) -> Layout is
         packages: text::path_join(root, "packages"),
         tools:    text::path_join(root, "tools"),
         home:     text::path_join(root, "home"),
+        temp:     text::path_join(root, "temp"),
         manifest: text::path_join(root, "manifest.toml") }
 end
 
@@ -53,6 +57,8 @@ end
 ;; ── Podkatalogi (stałe ścieżki, używane przez lpm i fasttree) ──────────────
 pub fn state_etc(l: Layout) -> string is return text::path_join(l.state, "etc") end
 pub fn state_var(l: Layout) -> string is return text::path_join(l.state, "var") end
+;; Prawdziwy katalog tymczasowy; /temp jest symlinkiem na niego (compat_links).
+pub fn temp_dir(l: Layout) -> string is return text::path_join(state_var(l), "tmp") end
 pub fn ft_root(l: Layout) -> string is return text::path_join(l.state, "fasttree") end
 pub fn lpm_dir(l: Layout) -> string is return text::path_join(l.state, "lpm") end
 pub fn lpm_cache(l: Layout) -> string is return text::path_join(lpm_dir(l), "cache") end
@@ -74,7 +80,7 @@ end
 pub fn compat_links() -> [string] is
     return ["usr=system", "bin=system/bin", "sbin=system/sbin", "lib=system/lib",
             "lib64=system/lib64", "etc=state/etc", "var=state/var", "srv=state/srv",
-            "root=state/root", "opt=system/opt"]
+            "root=state/root", "opt=system/opt", "temp=state/var/tmp"]
 end
 
 pub struct LayoutResult is
@@ -110,6 +116,8 @@ pub fn ensure(l: Layout) -> LayoutResult is
             created.push(d)
         end
     end
+    ;; katalog tymczasowy ma być zapisywalny dla wszystkich (sticky bit, jak /tmp)
+    let chm: bool = sys::ok("chmod 1777 " + sys::sq(temp_dir(l)))
     return LayoutResult { ok: true, error: "", created: created }
 end
 

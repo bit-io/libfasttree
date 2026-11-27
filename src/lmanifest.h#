@@ -424,6 +424,7 @@ pub fn new_os_manifest(n: NewOs) -> Doc is
     d = put_str(d, "layout", "packages", "/packages")
     d = put_str(d, "layout", "tools", "/tools")
     d = put_str(d, "layout", "home", "/home")
+    d = put_str(d, "layout", "temp", "/temp")
     d = put_str(d, "deployment", "tag", n.tag)
     d = put_str(d, "deployment", "parent", n.parent)
     d = put_int(d, "deployment", "generation", n.generation)

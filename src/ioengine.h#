@@ -38,9 +38,9 @@ pub fn read_file(eng: IoEngine, path: string) -> [int] is
 end
 
 pub fn write_file(eng: IoEngine, path: string, data: [int]) -> bool is
+    let n: int = data.len()
     let b: bytes = data
     fs::write_bytes(path, b)
-    let n: int = data.len()
     return fs::size(path) == n
 end
 

@@ -58,6 +58,7 @@ pub fn materialize_tree(m: manifest::Manifest, s: store::Store, materialized_dir
     while i < n is
         let e: manifest::FileEntry = m.entries[i]
         i += 1
+        if !text::safe_rel_path(e.path) is return cerr("niebezpieczna ścieżka w manifeście: '" + e.path + "'") end
         for h in e.chunks is
             if !store::has(s, h) is return cerr("brakujący chunk w store: " + h) end
         end

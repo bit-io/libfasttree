@@ -1,0 +1,55 @@
+use "std -> test" from "test"
+use "std -> env" from "env"
+mod check
+use "std -> fs" from "fs"
+mod text
+mod sys
+mod layout
+
+fn setup(name: string) -> string is
+    let root: string = text::path_join(sys::tmp_dir(), "fasttree-h-layout-" + name + "-" + text::istr(sys::pid()))
+    sys::rm_rf(root)
+    fs::mkdir(root)
+    return root
+end
+
+#[test]
+fn temp_is_symlink_to_state_var_tmp() is
+    let root: string = setup("temp")
+    let l: layout::Layout = layout::at(root)
+    let r: layout::LayoutResult = layout::ensure(l)
+    test::assert_true(r.ok)
+    let made: [string] = layout::apply_compat_links(l)
+    test::assert_true(sys::is_symlink(l.temp))
+    test::assert_true(sys::readlink(l.temp) == "state/var/tmp")
+    test::assert_true(fs::is_dir(layout::temp_dir(l)))
+    sys::rm_rf(root)
+end
+
+#[test]
+fn temp_is_writable_through_symlink() is
+    let root: string = setup("write")
+    let l: layout::Layout = layout::at(root)
+    let r: layout::LayoutResult = layout::ensure(l)
+    let made: [string] = layout::apply_compat_links(l)
+    test::assert_true(fs::write(text::path_join(l.temp, "x"), "ok"))
+    test::assert_true(fs::exists(text::path_join(layout::temp_dir(l), "x")))
+    sys::rm_rf(root)
+end
+
+#[test]
+fn validate_flags_temp_that_is_a_real_dir() is
+    let root: string = setup("bad")
+    let l: layout::Layout = layout::at(root)
+    let r: layout::LayoutResult = layout::ensure(l)
+    fs::mkdir(l.temp)
+    let p: [string] = layout::validate(l)
+    let mut found: bool = false
+    let mut i: int = 0
+    while i < p.len() is
+        if text::contains(p[i], "temp") is found = true end
+        i += 1
+    end
+    test::assert_true(found)
+    sys::rm_rf(root)
+end

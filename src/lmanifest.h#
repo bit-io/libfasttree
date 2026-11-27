@@ -376,7 +376,7 @@ end
 
 pub fn save(path: string, d: Doc) -> string is
     let tmp: string = path + ".tmp." + text::istr(sys::pid())
-    if !fs::write(tmp, emit(d)) is return "nie można zapisać " + tmp end
+    if !sys::write_text(tmp, emit(d)) is return "nie można zapisać " + tmp end
     fs::rename(tmp, path)
     return ""
 end

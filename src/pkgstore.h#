@@ -283,7 +283,7 @@ pub fn install_dir(l: layout::Layout, spec: PkgSpec, content_dir: string) -> Pkg
             e += 1
             if valid_component(exe) is
                 let real: string = text::path_join(text::path_join(text::path_join(final, "content"), "bin"), exe)
-                let w: bool = fs::write(text::path_join(wrapdir, exe), wrapper_script(real, libs, host_driver_dirs()))
+                let w: bool = sys::write_text(text::path_join(wrapdir, exe), wrapper_script(real, libs, host_driver_dirs()))
                 let chm: bool = sys::ok("chmod 0755 " + sys::sq(text::path_join(wrapdir, exe)))
             end
         end

@@ -45,7 +45,7 @@ pub fn open(root: string) -> OpenResult is
         end
         return OpenResult { ok: true, error: "", store: Store { root: root, format_version: version } }
     end
-    let w: bool = fs::write(ff, text::istr(cur))
+    let w: bool = sys::write_text(ff, text::istr(cur))
     if !w is
         return OpenResult { ok: false, store: none_store(), error: "nie można zapisać " + ff }
     end
@@ -77,9 +77,9 @@ pub fn put(s: Store, data: [int]) -> PutResult is
     if !fs::exists(path) is
         fs::mkdir(text::dirname(path))
         let tmp: string = path + ".tmp." + text::istr(sys::pid())
+        let n: int = data.len()
         let b: bytes = data
         fs::write_bytes(tmp, b)
-        let n: int = data.len()
         let sz: int = fs::size(tmp)
         if sz != n is
             sys::rm_f(tmp)

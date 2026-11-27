@@ -179,7 +179,7 @@ pub fn unpin(root: string, tag: string) -> RepoResult is
         end
     end
     if removed > 0 is
-        if !fs::write(path, json::to_pretty(json::jarr(keep))) is
+        if !sys::write_text(path, json::to_pretty(json::jarr(keep))) is
             return rerr("nie można zapisać " + path)
         end
     end
@@ -204,8 +204,8 @@ pub fn rollback(root: string) -> RepoResult is
     if sys::exists_any(tmp) is sys::rm_f(tmp) end
     if !sys::symlink(image, tmp) is return rerr("nie można utworzyć symlinku " + tmp) end
     fs::rename(tmp, link)
-    if !fs::write(text::path_join(root, "CURRENT_TAG"), prev) is return rerr("nie można zapisać CURRENT_TAG") end
-    if !fs::write(text::path_join(root, "PREVIOUS_TAG"), cur) is return rerr("nie można zapisać PREVIOUS_TAG") end
+    if !sys::write_text(text::path_join(root, "CURRENT_TAG"), prev) is return rerr("nie można zapisać CURRENT_TAG") end
+    if !sys::write_text(text::path_join(root, "PREVIOUS_TAG"), cur) is return rerr("nie można zapisać PREVIOUS_TAG") end
     return rok(prev)
 end
 

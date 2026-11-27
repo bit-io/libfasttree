@@ -4,7 +4,7 @@ Następca OSTree: content-addressable, zorientowany blokowo, bez hardlinków.
 **Cała biblioteka i CLI są napisane w H#.** Dla innych języków jest stabilne
 C ABI (`ft_*`).
 
-> **0.6.0:** FastTree jest używany jako **biblioteka** (`use "bit -> libfasttree" from "ft"`) przez lpm, lepm i
+> **0.8.0:** FastTree jest używany jako **biblioteka** (`use "bit -> libfasttree" from "ft"`) przez lpm, lepm i
 > LegendaryOS-Builder — przez fasadę `ft::api::*` (`src/api.h#`). Zob. `docs/USING-AS-LIBRARY.md`.
 
 ## Dlaczego nie OSTree
@@ -45,7 +45,7 @@ src/composefs.h#        obraz composefs + mount + dm-verity
 src/overlay.h#          OverlayFS (ulotny tmpfs / trwały)
 src/cli.h#              komendy CLI
 src/ft.h#               STABILNE C ABI (symbole ft_*) — jedyna powierzchnia FFI
-src/tests/*_test.h#     94 testy jednostkowe H#
+src/tests/*_test.h#     72 testy jednostkowe H#
 scripts/                build-lib.sh, run-tests.sh
 ```
 
@@ -140,13 +140,26 @@ Zweryfikowane przez uruchomienie (kompilator h# 0.9.0, Linux x86_64):
 * Pełny `pull` z fikcyjnego rejestru z **Bearer auth**, whiteoutem, opaque
   whiteoutem, hardlinkiem, symlinkiem i bitem wykonania; rekonstrukcja plików
   ze store bajt w bajt; `pin`, `gc` (usuwanie sierot, abort przy braku manifestu).
-* 94 testy H# (0.3: fsck, repo, stats, ABI na poziomie H#, CLI end-to-end; 0.4: derive).
+* 72 testy H# w 14 plikach (`scripts/run-tests.sh`): fsck, repo, stats, ABI, CLI end-to-end, derive, utwardzenie (0.8).
 * 0.3: pełny przepływ CLI (snapshot, diff, checkout, fsck z uszkodzeniem i `--repair`, pin/rm/rollback) na prawdziwych plikach.
 
 **Nie zweryfikowane** (brak środowiska): symbole C `ft_*` rozszerzeń 0.3 (sprawdzone tylko z poziomu H#; potrzebny backend LLVM — z backendem C++ kompilator eksportuje nazwy zmanglowane), `.github/workflows/ci.yml`, prawdziwe `mkcomposefs`/`mount.composefs`, `overlay commit` na zamontowanym overlayu (logika `derive` jest testowana na katalogach),
 dm-verity z device-mapper, `mount -t overlay` (w testach `deploy` użyto atrap
 narzędzi; ścieżki błędów i wykrywanie możliwości są testowane), `ci.yml` na
 prawdziwym GitHub Actions.
+
+## Zmiany w 0.8.0
+
+* **Naprawa kompilacji**: `sys::write_text` nie zależy już od typu zwracanego
+  `fs::write` (bool/void zależnie od stdlib) — błąd „return type mismatch in
+  `sys_write_text`: expected `bool`, found `void`”. Wszystkie zapisy tekstowe
+  przechodzą przez `sys::write_text` i są **atomowe** (tmp + rename + weryfikacja rozmiaru).
+* Usunięto ostrzeżenia M001 (`data` użyte po przeniesieniu) w `store::put` i `ioengine::write_file`.
+* **Wydajność**: `blake3::compress` rozwinięty bez alokacji, pełne bloki czytane
+  bez pętli wewnętrznych — snapshot ~36 MiB: 2.45 s → 1.57 s, `root` manifestu bez zmian.
+* **Bezpieczeństwo**: `text::safe_rel_path` + walidacja ścieżek w `materialize_tree`.
+* Dodano brakujące `scripts/build-lib.sh`, `scripts/run-tests.sh`, `docs/`.
+* Spójne wersje (`Bit.hk` = `api::version()` = 0.8.0).
 
 ## Znane ograniczenia
 
